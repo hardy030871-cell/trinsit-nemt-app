@@ -4,38 +4,46 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
-const multer = require('multer');
-let google;
-try { google = require('googleapis').google; } catch (e) { google = null; }
+let google = null;
+try { google = require('googleapis').google; } catch {}
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { cors: { origin: '*' } });
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'trinsit-super-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-trinsit';
 const DATA_DIR = path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, 'public')));
 
+function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
 function ensureFile(name, initialValue) {
+  ensureDir(DATA_DIR); ensureDir(UPLOAD_DIR);
   const filePath = path.join(DATA_DIR, name);
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, JSON.stringify(initialValue, null, 2));
 }
 function readJson(name) { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, name), 'utf8')); }
 function writeJson(name, value) { fs.writeFileSync(path.join(DATA_DIR, name), JSON.stringify(value, null, 2)); }
+function nowIso() { return new Date().toISOString(); }
+function normalizeEmail(v) { return String(v || '').trim().toLowerCase(); }
+function titleCase(v) { return String(v || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()); }
+function maskUser(user) { const { passwordHash, ...safe } = user; return safe; }
 
 ensureFile('users.json', []);
 ensureFile('trips.json', []);
 ensureFile('attendance.json', []);
+ensureFile('expenses.json', []);
+ensureFile('inspections.json', []);
+ensureFile('incidents.json', []);
+ensureFile('equipment.json', []);
 ensureFile('priceSettings.json', {
   services: { ambulatory: 60, wheelchair: 110, stretcher: 220, climbing_stairs_chair: 180, own_wheelchair: 95 },
   mileageTiers: [{ upTo: 10, rate: 0 }, { upTo: 39, rate: 4 }, { upTo: 99, rate: 5.5 }, { upTo: 9999, rate: 7.6 }],
@@ -44,104 +52,105 @@ ensureFile('priceSettings.json', {
   oxygen: { base: 25, perLiter: 7 },
   extraStop: 40
 });
-ensureFile('equipment.json', []);
-ensureFile('incidents.json', []);
-ensureFile('inspections.json', []);
-ensureFile('expenses.json', []);
 ensureFile('gps.json', {});
 ensureFile('notifications.json', []);
 ensureFile('messages.json', []);
-
-const tripWorkflow = ['assigned', 'received', 'trip_in_progress', 'arrived', 'facesheet_uploaded', 'leaving_with_patient', 'drop_off', 'completed'];
+ensureFile('payers.json', ['Medicaid', 'Private Pay', 'Facility', 'Insurance']);
+ensureFile('vehicles.json', []);
+ensureFile('invoiceRuns.json', []);
 
 function seedUsers() {
   const users = readJson('users.json');
   if (users.length) return;
-  const defaultUsers = [
-    { id: uuidv4(), name: 'Admin User', email: 'admin@trinsit.local', passwordHash: bcrypt.hashSync('Admin123!', 10), role: 'admin', active: true },
-    { id: uuidv4(), name: 'Manager User', email: 'manager@trinsit.local', passwordHash: bcrypt.hashSync('Manager123!', 10), role: 'manager', active: true },
-    { id: uuidv4(), name: 'Dispatcher User', email: 'dispatcher@trinsit.local', passwordHash: bcrypt.hashSync('Dispatcher123!', 10), role: 'dispatcher', active: true },
-    { id: uuidv4(), name: 'Driver User', email: 'driver@trinsit.local', passwordHash: bcrypt.hashSync('Driver123!', 10), role: 'driver', active: true },
-    { id: uuidv4(), name: 'Contract Driver', email: 'contractor@trinsit.local', passwordHash: bcrypt.hashSync('Contract123!', 10), role: 'contractor_driver', active: true }
-  ];
-  writeJson('users.json', defaultUsers);
+  const demo = [
+    ['Admin User','admin@trinsit.local','admin','Admin123!'],
+    ['Manager User','manager@trinsit.local','manager','Manager123!'],
+    ['Dispatcher User','dispatcher@trinsit.local','dispatcher','Dispatcher123!'],
+    ['Driver User','driver@trinsit.local','driver','Driver123!'],
+    ['Contract Driver','contractor@trinsit.local','contractor_driver','Contract123!']
+  ].map(([name,email,role,password], i)=>(
+    { id: uuidv4(), name, email, role, active: true, accountStatus: 'active', mustCompleteProfile: role !== 'admin', passwordHash: bcrypt.hashSync(password, 10), pinHash: bcrypt.hashSync(String(111111 + i), 10), phone:'', dateOfBirth:'', certificate:'', address:'', identityFile:null, createdAt: nowIso(), updatedAt: nowIso() }
+  ));
+  writeJson('users.json', demo);
 }
 seedUsers();
 
+const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024, files: 8 } });
 const onlineUsers = new Map();
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 15 * 1024 * 1024, files: 8 } });
 
 function authRequired(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/, '');
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const users = readJson('users.json');
-    const user = users.find(u => u.id === payload.userId);
-    if (!user) return res.status(401).json({ error: 'Invalid token user' });
+    const user = readJson('users.json').find(u => u.id === payload.userId);
+    if (!user || user.accountStatus === 'deleted') return res.status(401).json({ error: 'User not found' });
+    if (user.accountStatus === 'suspended' || user.accountStatus === 'closed') return res.status(403).json({ error: `Account ${user.accountStatus}` });
     req.user = user;
     next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
   }
 }
-function roleRequired(...roles) { return (req, res, next) => roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' }); }
+function roleRequired(...roles) {
+  return (req, res, next) => roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' });
+}
 
 function sanitizeTripForRole(trip, role) {
-  if (role === 'driver' || role === 'contractor_driver') {
-    const { payer, dateOfBirth, mrn, ...allowed } = trip;
-    return allowed;
+  if (['driver','contractor_driver'].includes(role)) {
+    const { priceBreakdown, payer, dateOfBirth, mrn, ...rest } = trip;
+    return rest;
   }
   return trip;
 }
-function createNotification(userIds, title, body, type = 'info', extra = {}) {
-  const notifications = readJson('notifications.json');
-  const batch = userIds.map(userId => ({ id: uuidv4(), userId, title, body, type, read: false, createdAt: new Date().toISOString(), ...extra }));
-  writeJson('notifications.json', [...batch, ...notifications].slice(0, 1000));
-  batch.forEach(item => io.to(item.userId).emit('notification', item));
+function latestAttendanceForUser(userId) { return readJson('attendance.json').find(x => x.userId === userId); }
+function isClockedIn(userId) {
+  const latest = latestAttendanceForUser(userId);
+  if (!latest) return false;
+  return ['clock_in','lunch_in'].includes(latest.type);
+}
+function nextTripNumber() {
+  const trips = readJson('trips.json');
+  const max = trips.reduce((m, t) => Math.max(m, Number(String(t.tripNumber || '').split('-').pop()) || 0), 0);
+  return `TRIP-${String(max + 1).padStart(6, '0')}`;
 }
 function calcMileagePrice(miles, settings) {
-  let remaining = miles, previousCap = 0, total = 0;
-  for (const tier of settings.mileageTiers) {
-    const milesInTier = Math.max(Math.min(remaining, tier.upTo - previousCap), 0);
-    total += milesInTier * tier.rate;
-    remaining -= milesInTier;
-    previousCap = tier.upTo;
+  let remaining = Number(miles || 0); let total = 0; let prev = 0;
+  for (const tier of settings.mileageTiers || []) {
+    const amount = Math.max(Math.min(remaining, tier.upTo - prev), 0);
+    total += amount * Number(tier.rate || 0);
+    remaining -= amount; prev = tier.upTo;
     if (remaining <= 0) break;
   }
   return total;
 }
-function calculateTripPrice(payload, settings) {
-  const serviceKey = (payload.service || '').toLowerCase().replace(/ /g, '_');
-  const base = settings.services[serviceKey] || 0;
-  const miles = Number(payload.mileage || 0);
-  const weight = Number(payload.weight || 0);
+function calculateTripPrice(payload) {
+  const settings = readJson('priceSettings.json');
+  const serviceKey = String(payload.service || '').toLowerCase().replace(/ /g, '_');
+  const base = Number(settings.services[serviceKey] || 0);
+  const mileageFee = calcMileagePrice(payload.mileage, settings);
+  const weightFee = Number(payload.weight || 0) >= Number(settings.bariatricThreshold || 250) ? Number(settings.weightSurcharge || 0) : 0;
   const oxygenLiters = payload.oxygen === true || payload.oxygen === 'Yes' ? Number(payload.oxygenLiters || 0) : 0;
-  const stops = payload.additionalStops || [];
-  const mileageFee = calcMileagePrice(miles, settings);
-  const weightFee = weight >= settings.bariatricThreshold ? settings.weightSurcharge : 0;
-  const oxygenFee = oxygenLiters > 0 ? settings.oxygen.base + oxygenLiters * settings.oxygen.perLiter : 0;
-  const stopFee = stops.length * settings.extraStop;
-  const total = base + mileageFee + weightFee + oxygenFee + stopFee;
-  return { base, mileageFee, weightFee, oxygenFee, stopFee, total };
+  const oxygenFee = oxygenLiters > 0 ? Number(settings.oxygen.base || 0) + oxygenLiters * Number(settings.oxygen.perLiter || 0) : 0;
+  const stopFee = (payload.additionalStops || []).length * Number(settings.extraStop || 0);
+  return { base, mileageFee, weightFee, oxygenFee, stopFee, total: base + mileageFee + weightFee + oxygenFee + stopFee };
 }
-function latestAttendanceForUser(userId) {
-  return readJson('attendance.json').find(a => a.userId === userId);
+function parseMaybeJson(value, fallback = []) { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
+function createNotification(userIds, title, body, type='info', extra={}) {
+  const all = readJson('notifications.json');
+  const items = [...new Set(userIds)].filter(Boolean).map(userId => ({ id: uuidv4(), userId, title, body, type, createdAt: nowIso(), read: false, ...extra }));
+  writeJson('notifications.json', [...items, ...all].slice(0, 5000));
+  items.forEach(n => io.to(n.userId).emit('notification', n));
 }
-function isUserClockedIn(userId) {
-  const latest = latestAttendanceForUser(userId);
-  if (!latest) return false;
-  return latest.type === 'clock_in' || latest.type === 'lunch_in';
+function requiredTripFields(body) {
+  const missing = [];
+  ['pickupDate','pickupTime','patientName','pickupLocation','service','weight','dropoffLocation','caregiverOnBoard','note','dateOfBirth','payer'].forEach(k => { if (body[k] === undefined || body[k] === '') missing.push(k); });
+  if ((body.oxygen === true || body.oxygen === 'Yes') && !body.oxygenLiters) missing.push('oxygenLiters');
+  if ((body.caregiverOnBoard === true || body.caregiverOnBoard === 'Yes') && (body.caregiverCount === undefined || body.caregiverCount === '')) missing.push('caregiverCount');
+  return missing;
 }
-function parseJsonField(value, fallback) {
-  try { return value ? JSON.parse(value) : fallback; } catch { return fallback; }
-}
-
 async function uploadFileToGoogleDrive(localPath, originalName, mimeType) {
-  if (!google || !process.env.GOOGLE_DRIVE_CLIENT_EMAIL || !process.env.GOOGLE_DRIVE_PRIVATE_KEY || !process.env.GOOGLE_DRIVE_FOLDER_ID) {
-    return null;
-  }
+  if (!google || !process.env.GOOGLE_DRIVE_CLIENT_EMAIL || !process.env.GOOGLE_DRIVE_PRIVATE_KEY || !process.env.GOOGLE_DRIVE_FOLDER_ID) return null;
   const auth = new google.auth.JWT({
     email: process.env.GOOGLE_DRIVE_CLIENT_EMAIL,
     key: process.env.GOOGLE_DRIVE_PRIVATE_KEY.replace(/\\n/g, '\n'),
@@ -151,188 +160,281 @@ async function uploadFileToGoogleDrive(localPath, originalName, mimeType) {
   const response = await drive.files.create({
     requestBody: { name: `${Date.now()}-${originalName}`, parents: [process.env.GOOGLE_DRIVE_FOLDER_ID] },
     media: { mimeType, body: fs.createReadStream(localPath) },
-    fields: 'id, webViewLink, webContentLink'
+    fields: 'id,webViewLink,webContentLink'
   });
-  return { fileId: response.data.id, viewLink: response.data.webViewLink || '', downloadLink: response.data.webContentLink || '' };
+  return { id: response.data.id, viewLink: response.data.webViewLink || '', downloadLink: response.data.webContentLink || '' };
 }
-async function buildStoredFile(file) {
+async function storeUploaded(file) {
   const localUrl = `/uploads/${path.basename(file.path)}`;
   let drive = null;
-  try {
-    drive = await uploadFileToGoogleDrive(file.path, file.originalname, file.mimetype);
-  } catch (err) {
-    console.error('Google Drive upload failed:', err.message);
-  }
-  return {
-    id: uuidv4(),
-    originalName: file.originalname,
-    mimeType: file.mimetype,
-    size: file.size,
-    localUrl,
-    storage: drive ? 'google_drive' : 'local',
-    googleDrive: drive,
-    uploadedAt: new Date().toISOString()
-  };
+  try { drive = await uploadFileToGoogleDrive(file.path, file.originalname, file.mimetype); } catch (e) { console.error(e.message); }
+  return { id: uuidv4(), originalName: file.originalname, mimeType: file.mimetype, localUrl, storage: drive ? 'google_drive' : 'local', googleDrive: drive, uploadedAt: nowIso() };
 }
+async function tryCreateSheetInvoiceBatch() {
+  const runs = readJson('invoiceRuns.json');
+  const now = new Date();
+  const epochSunday = new Date('2026-01-04T23:00:00');
+  const diffWeeks = Math.floor((now - epochSunday) / (7 * 24 * 3600 * 1000));
+  const isBiweekly = diffWeeks >= 0 && diffWeeks % 2 === 0;
+  if (!(now.getDay() === 0 && now.getHours() === 23 && isBiweekly)) return;
+  const runKey = `${now.getUTCFullYear()}-${now.getUTCMonth()+1}-${now.getUTCDate()}-${now.getUTCHours()}`;
+  if (runs.find(r => r.runKey === runKey)) return;
+  const trips = readJson('trips.json').filter(t => t.status === 'completed');
+  const batch = trips.map(t => [t.tripNumber, t.pickupDate, t.patientName, t.payer, Number(t.mileage || 0), Number(t.priceBreakdown?.total || 0)]);
+  const result = { id: uuidv4(), runKey, createdAt: nowIso(), tripCount: batch.length, status: 'local_only' };
+  runs.unshift(result); writeJson('invoiceRuns.json', runs.slice(0, 200));
+  if (!google || !process.env.GOOGLE_SHEETS_CLIENT_EMAIL || !process.env.GOOGLE_SHEETS_PRIVATE_KEY || !process.env.GOOGLE_SHEETS_SPREADSHEET_ID) return;
+  try {
+    const auth = new google.auth.JWT({ email: process.env.GOOGLE_SHEETS_CLIENT_EMAIL, key: process.env.GOOGLE_SHEETS_PRIVATE_KEY.replace(/\\n/g, '\n'), scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+    const sheets = google.sheets({ version: 'v4', auth });
+    const title = `Invoices ${now.toISOString().slice(0,10)}`;
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID, requestBody: { requests: [{ addSheet: { properties: { title } } }] } }).catch(()=>{});
+    await sheets.spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID, range: `${title}!A1`, valueInputOption: 'RAW', requestBody: { values: [['Trip ID','Date','Patient','Payer','Mileage','Gross'], ...batch] } });
+    result.status = 'sheet_written'; writeJson('invoiceRuns.json', runs);
+  } catch (e) { console.error('Invoice sheet write failed', e.message); }
+}
+setInterval(tryCreateSheetInvoiceBatch, 60000);
 
 app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  const users = readJson('users.json');
-  const user = users.find(u => u.email.toLowerCase() === String(email || '').toLowerCase());
-  if (!user || !bcrypt.compareSync(password || '', user.passwordHash)) return res.status(401).json({ error: 'Invalid email or password' });
+  const { email, password, pin } = req.body;
+  const user = readJson('users.json').find(u => normalizeEmail(u.email) === normalizeEmail(email));
+  if (!user) return res.status(401).json({ error: 'Invalid login' });
+  if (['suspended','closed','deleted'].includes(user.accountStatus)) return res.status(403).json({ error: `Account ${user.accountStatus}` });
+  const passwordOk = password ? bcrypt.compareSync(String(password), user.passwordHash) : false;
+  const pinOk = pin ? bcrypt.compareSync(String(pin), user.pinHash || '$2a$10$invalidinvalidinvalidinva') : false;
+  if (!passwordOk && !pinOk) return res.status(401).json({ error: 'Invalid login' });
   const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: '12h' });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  res.json({ token, user: maskUser(user) });
 });
-app.get('/api/me', authRequired, (req, res) => res.json({ id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role }));
-app.get('/api/users', authRequired, roleRequired('admin', 'manager', 'dispatcher'), (req, res) => res.json(readJson('users.json').map(({ passwordHash, ...u }) => u)));
+app.get('/api/me', authRequired, (req, res) => res.json(maskUser(req.user)));
+app.post('/api/me/complete-profile', authRequired, upload.single('identityFile'), async (req, res) => {
+  const users = readJson('users.json');
+  const idx = users.findIndex(u => u.id === req.user.id);
+  const fileMeta = req.file ? await storeUploaded(req.file) : users[idx].identityFile;
+  const updated = { ...users[idx], phone: req.body.phone, dateOfBirth: req.body.dateOfBirth, certificate: req.body.certificate || '', address: req.body.address, identityFile: fileMeta, mustCompleteProfile: false, updatedAt: nowIso() };
+  users[idx] = updated; writeJson('users.json', users);
+  res.json(maskUser(updated));
+});
+
+app.get('/api/users', authRequired, roleRequired('admin','manager','dispatcher'), (req, res) => res.json(readJson('users.json').map(maskUser)));
 app.post('/api/users', authRequired, roleRequired('admin'), (req, res) => {
   const users = readJson('users.json');
-  const user = { id: uuidv4(), name: req.body.name, email: req.body.email, passwordHash: bcrypt.hashSync(req.body.password || 'Temp123!', 10), role: req.body.role, active: true };
-  users.push(user); writeJson('users.json', users); const { passwordHash, ...safe } = user; res.status(201).json(safe);
+  if (users.some(u => normalizeEmail(u.email) === normalizeEmail(req.body.email))) return res.status(400).json({ error: 'Email already exists' });
+  const pin = String(req.body.pin || Math.floor(100000 + Math.random() * 900000));
+  const user = {
+    id: uuidv4(), name: req.body.name, email: req.body.email, role: req.body.role, phone: '', dateOfBirth:'', certificate:'', address:'', identityFile:null,
+    active: true, accountStatus: 'active', mustCompleteProfile: true, passwordHash: bcrypt.hashSync(req.body.password || 'Temp123!', 10), pinHash: bcrypt.hashSync(pin, 10), createdAt: nowIso(), updatedAt: nowIso()
+  };
+  users.unshift(user); writeJson('users.json', users); res.status(201).json({ ...maskUser(user), plainPin: pin });
+});
+app.put('/api/users/:id', authRequired, roleRequired('admin'), (req, res) => {
+  const users = readJson('users.json');
+  const idx = users.findIndex(u => u.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'User not found' });
+  const next = { ...users[idx], ...req.body, updatedAt: nowIso() };
+  if (req.body.resetPin) {
+    const newPin = String(req.body.resetPin).padStart(6,'0').slice(0,6);
+    next.pinHash = bcrypt.hashSync(newPin, 10);
+    next.lastResetPin = newPin;
+  }
+  if (req.body.accountStatus && ['active','suspended','closed','deleted'].includes(req.body.accountStatus)) next.accountStatus = req.body.accountStatus;
+  users[idx] = next; writeJson('users.json', users); res.json(maskUser(next));
+});
+
+app.get('/api/payers', authRequired, (req, res) => res.json(readJson('payers.json')));
+app.post('/api/payers', authRequired, roleRequired('admin'), (req, res) => {
+  const payers = readJson('payers.json');
+  const name = String(req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Payer required' });
+  if (!payers.includes(name)) payers.push(name);
+  writeJson('payers.json', payers);
+  res.status(201).json(payers);
 });
 
 app.get('/api/price-settings', authRequired, (req, res) => res.json(readJson('priceSettings.json')));
 app.put('/api/price-settings', authRequired, roleRequired('admin'), (req, res) => { writeJson('priceSettings.json', req.body); res.json(req.body); });
-app.post('/api/pricing/calculate', authRequired, (req, res) => res.json(calculateTripPrice(req.body, readJson('priceSettings.json'))));
+app.post('/api/pricing/calculate', authRequired, (req, res) => res.json(calculateTripPrice(req.body)));
 
 app.get('/api/trips', authRequired, (req, res) => {
   const trips = readJson('trips.json');
-  let filtered = trips;
-  if (req.user.role === 'driver' || req.user.role === 'contractor_driver') filtered = trips.filter(t => t.assignedDriverId === req.user.id);
-  res.json(filtered.map(t => sanitizeTripForRole(t, req.user.role)));
+  const visible = ['driver','contractor_driver'].includes(req.user.role) ? trips.filter(t => (t.assignedDriverIds || []).includes(req.user.id)) : trips;
+  res.json(visible.map(t => sanitizeTripForRole(t, req.user.role)));
 });
-app.post('/api/trips', authRequired, roleRequired('admin', 'manager', 'dispatcher'), (req, res) => {
+app.post('/api/trips', authRequired, roleRequired('admin','manager','dispatcher'), (req, res) => {
+  const missing = requiredTripFields(req.body);
+  if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
   const trips = readJson('trips.json');
-  const settings = readJson('priceSettings.json');
-  const priceBreakdown = calculateTripPrice(req.body, settings);
+  const assignedDriverIds = Array.isArray(req.body.assignedDriverIds) ? req.body.assignedDriverIds.slice(0,2) : (req.body.assignedDriverId ? [req.body.assignedDriverId] : []);
   const trip = {
-    id: uuidv4(),
-    pickupDate: req.body.pickupDate, pickupTime: req.body.pickupTime, patientName: req.body.patientName,
-    pickupLocation: req.body.pickupLocation, roomNumber: req.body.roomNumber, service: req.body.service,
-    weight: Number(req.body.weight || 0), dropoffLocation: req.body.dropoffLocation,
-    additionalStops: req.body.additionalStops || [], oxygen: req.body.oxygen, oxygenLiters: Number(req.body.oxygenLiters || 0),
-    caregiverOnBoard: req.body.caregiverOnBoard, caregiverCount: Number(req.body.caregiverCount || 0), note: req.body.note,
-    dateOfBirth: req.body.dateOfBirth, mrn: req.body.mrn, payer: req.body.payer, mileage: Number(req.body.mileage || 0),
-    priceBreakdown, assignedDriverId: req.body.assignedDriverId || null, status: req.body.assignedDriverId ? 'assigned' : 'open',
-    workflow: { receivedAt: null, tripInProgressAt: null, arrivedAt: null, facesheetUploadedAt: null, leavingWithPatientAt: null, dropOffAt: null, completedAt: null },
-    facesheetFiles: [], createdBy: req.user.id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    id: uuidv4(), tripNumber: nextTripNumber(), pickupDate: req.body.pickupDate, pickupTime: req.body.pickupTime, patientName: req.body.patientName,
+    pickupLocation: req.body.pickupLocation, roomNumber: req.body.roomNumber || '', service: req.body.service, weight: Number(req.body.weight || 0),
+    dropoffLocation: req.body.dropoffLocation, additionalStops: req.body.additionalStops || [], oxygen: req.body.oxygen, oxygenLiters: Number(req.body.oxygenLiters || 0),
+    caregiverOnBoard: req.body.caregiverOnBoard, caregiverCount: Number(req.body.caregiverCount || 0), note: req.body.note, dateOfBirth: req.body.dateOfBirth, mrn: req.body.mrn || '', payer: req.body.payer,
+    mileage: Number(req.body.mileage || 0), googleMileage: Number(req.body.googleMileage || req.body.mileage || 0), assignedDriverIds, status: assignedDriverIds.length ? 'assigned' : 'open',
+    tripLogs: [{ status: assignedDriverIds.length ? 'assigned' : 'open', by: req.user.name, at: nowIso() }], facesheetFiles: [], cancelledAt: null, createdBy: req.user.id, createdAt: nowIso(), updatedAt: nowIso(),
+    priceBreakdown: calculateTripPrice(req.body), vehicleUnit: req.body.vehicleUnit || ''
   };
   trips.unshift(trip); writeJson('trips.json', trips);
-  if (trip.assignedDriverId) createNotification([trip.assignedDriverId], 'New Trip Assigned', `${trip.patientName} - ${trip.pickupDate} ${trip.pickupTime}`, 'trip', { tripId: trip.id });
-  io.emit('trip:created', trip); res.status(201).json(trip);
+  if (assignedDriverIds.length) createNotification(assignedDriverIds, 'Trip Assigned', `${trip.tripNumber} ${trip.patientName} ${trip.pickupDate} ${trip.pickupTime}`, 'trip', { tripId: trip.id });
+  io.emit('trip:updated', trip); res.status(201).json(trip);
 });
-app.put('/api/trips/:id', authRequired, roleRequired('admin', 'manager', 'dispatcher', 'driver', 'contractor_driver'), (req, res) => {
+app.put('/api/trips/:id', authRequired, roleRequired('admin','manager','dispatcher','driver','contractor_driver'), (req, res) => {
   const trips = readJson('trips.json');
-  const index = trips.findIndex(t => t.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'Trip not found' });
-  const current = trips[index];
-  if ((req.user.role === 'driver' || req.user.role === 'contractor_driver') && current.assignedDriverId !== req.user.id) return res.status(403).json({ error: 'Trip not assigned to you' });
-  const nextStatus = req.body.status;
-  if ((req.user.role === 'driver' || req.user.role === 'contractor_driver') && nextStatus && nextStatus !== current.status) {
-    if (!isUserClockedIn(req.user.id)) return res.status(400).json({ error: 'Driver must clock in before starting trip workflow' });
-    const currentIndex = tripWorkflow.indexOf(current.status);
-    const nextIndex = tripWorkflow.indexOf(nextStatus);
-    if (nextIndex !== -1 && currentIndex !== -1 && nextIndex !== currentIndex + 1) return res.status(400).json({ error: 'Trip steps must be completed in order' });
-    if (nextStatus === 'facesheet_uploaded' && !(current.facesheetFiles || []).length) return res.status(400).json({ error: 'Upload facesheet before selecting this step' });
+  const idx = trips.findIndex(t => t.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Trip not found' });
+  const current = trips[idx];
+  if (['driver','contractor_driver'].includes(req.user.role) && !(current.assignedDriverIds || []).includes(req.user.id)) return res.status(403).json({ error: 'Not assigned' });
+  const next = { ...current, ...req.body, updatedAt: nowIso() };
+  if (['driver','contractor_driver'].includes(req.user.role)) {
+    if (!isClockedIn(req.user.id)) return res.status(400).json({ error: 'Clock in before trip work' });
+    const validOrder = ['assigned','received','trip_in_progress','arrived','leaving_with_patient','drop_off','completed'];
+    if (req.body.status && validOrder.includes(req.body.status)) {
+      const ci = validOrder.indexOf(current.status), ni = validOrder.indexOf(req.body.status);
+      if (!(ni === ci + 1 || (current.status === 'arrived' && req.body.status === 'leaving_with_patient' && (current.facesheetFiles||[]).length))) {
+        return res.status(400).json({ error: 'Trip statuses must be completed in order' });
+      }
+    }
   }
-  const updated = { ...current, ...req.body, updatedAt: new Date().toISOString() };
-  updated.workflow = updated.workflow || current.workflow || {};
-  const stampMap = { received: 'receivedAt', trip_in_progress: 'tripInProgressAt', arrived: 'arrivedAt', facesheet_uploaded: 'facesheetUploadedAt', leaving_with_patient: 'leavingWithPatientAt', drop_off: 'dropOffAt', completed: 'completedAt' };
-  if (stampMap[nextStatus]) updated.workflow[stampMap[nextStatus]] = new Date().toISOString();
-  trips[index] = updated; writeJson('trips.json', trips); io.emit('trip:updated', updated); res.json(sanitizeTripForRole(updated, req.user.role));
+  if (req.body.cancelled === true || req.body.status === 'cancelled') { next.status = 'cancelled'; next.cancelledAt = nowIso(); }
+  if (req.body.assignedDriverIds) next.assignedDriverIds = req.body.assignedDriverIds.slice(0,2);
+  if (req.body.status && req.body.status !== current.status) next.tripLogs = [...(current.tripLogs || []), { status: req.body.status, by: req.user.name, at: nowIso() }];
+  next.priceBreakdown = calculateTripPrice(next);
+  trips[idx] = next; writeJson('trips.json', trips);
+  if (JSON.stringify(current.assignedDriverIds || []) !== JSON.stringify(next.assignedDriverIds || [])) createNotification(next.assignedDriverIds || [], 'Trip Reassigned', `${next.tripNumber} reassigned`, 'trip', { tripId: next.id });
+  io.emit('trip:updated', next); res.json(sanitizeTripForRole(next, req.user.role));
 });
-app.post('/api/trips/:id/facesheet', authRequired, roleRequired('driver', 'contractor_driver', 'admin', 'manager', 'dispatcher'), upload.single('file'), async (req, res) => {
+app.post('/api/trips/:id/facesheet', authRequired, roleRequired('driver','contractor_driver','admin','manager','dispatcher'), upload.single('file'), async (req, res) => {
   const trips = readJson('trips.json');
-  const index = trips.findIndex(t => t.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'Trip not found' });
-  if (!req.file) return res.status(400).json({ error: 'Facesheet file required' });
-  const trip = trips[index];
-  if ((req.user.role === 'driver' || req.user.role === 'contractor_driver') && trip.assignedDriverId !== req.user.id) return res.status(403).json({ error: 'Trip not assigned to you' });
-  const fileMeta = await buildStoredFile(req.file);
-  trip.facesheetFiles = [...(trip.facesheetFiles || []), fileMeta];
-  trip.updatedAt = new Date().toISOString();
-  trips[index] = trip; writeJson('trips.json', trips); io.emit('trip:updated', trip); res.status(201).json(fileMeta);
+  const idx = trips.findIndex(t => t.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Trip not found' });
+  if (!req.file) return res.status(400).json({ error: 'File required' });
+  const meta = await storeUploaded(req.file);
+  trips[idx].facesheetFiles = [...(trips[idx].facesheetFiles || []), meta];
+  trips[idx].tripLogs = [...(trips[idx].tripLogs || []), { status: 'facesheet_uploaded', by: req.user.name, at: nowIso() }];
+  trips[idx].updatedAt = nowIso();
+  writeJson('trips.json', trips);
+  io.emit('trip:updated', trips[idx]);
+  res.status(201).json(meta);
 });
 
-app.post('/api/attendance/clock', authRequired, (req, res) => {
+app.post('/api/attendance/clock', authRequired, async (req, res) => {
   const attendance = readJson('attendance.json');
-  const event = { id: uuidv4(), userId: req.user.id, name: req.user.name, role: req.user.role, type: req.body.type, lat: req.body.lat, lng: req.body.lng, accuracy: req.body.accuracy, createdAt: new Date().toISOString() };
-  attendance.unshift(event); writeJson('attendance.json', attendance.slice(0, 5000)); res.status(201).json(event);
+  const item = {
+    id: uuidv4(), userId: req.user.id, name: req.user.name, role: req.user.role, type: req.body.type, lat: req.body.lat, lng: req.body.lng, accuracy: req.body.accuracy,
+    address: req.body.address || `${req.body.lat || ''}, ${req.body.lng || ''}`,
+    commissionPay: !!req.body.commissionPay, commissionTrips: req.body.commissionTrips || [], createdAt: nowIso()
+  };
+  attendance.unshift(item); writeJson('attendance.json', attendance.slice(0, 5000));
+  if (item.type === 'clock_out') {
+    const gps = readJson('gps.json'); delete gps[req.user.id]; writeJson('gps.json', gps); io.emit('gps:clear', { userId: req.user.id });
+  }
+  res.status(201).json(item);
 });
-app.get('/api/attendance', authRequired, roleRequired('admin', 'manager', 'dispatcher'), (req, res) => res.json(readJson('attendance.json')));
+app.get('/api/attendance', authRequired, roleRequired('admin','manager','dispatcher'), (req, res) => res.json(readJson('attendance.json')));
+app.put('/api/attendance/:id', authRequired, roleRequired('admin'), (req, res) => {
+  const attendance = readJson('attendance.json');
+  const idx = attendance.findIndex(a => a.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Attendance not found' });
+  attendance[idx] = { ...attendance[idx], ...req.body };
+  writeJson('attendance.json', attendance); res.json(attendance[idx]);
+});
 
 app.post('/api/gps/update', authRequired, (req, res) => {
+  if (['driver','contractor_driver'].includes(req.user.role) && !isClockedIn(req.user.id)) return res.status(400).json({ error: 'Clock in first' });
   const gps = readJson('gps.json');
-  gps[req.user.id] = { userId: req.user.id, name: req.user.name, role: req.user.role, lat: req.body.lat, lng: req.body.lng, accuracy: req.body.accuracy, tripId: req.body.tripId || null, updatedAt: new Date().toISOString() };
+  gps[req.user.id] = { userId: req.user.id, name: req.user.name, role: req.user.role, lat: req.body.lat, lng: req.body.lng, accuracy: req.body.accuracy, updatedAt: nowIso() };
   writeJson('gps.json', gps); io.emit('gps:update', gps[req.user.id]); res.json(gps[req.user.id]);
 });
-app.get('/api/gps', authRequired, roleRequired('admin', 'manager', 'dispatcher'), (req, res) => res.json(Object.values(readJson('gps.json'))));
+app.get('/api/gps', authRequired, roleRequired('admin','manager','dispatcher'), (req, res) => res.json(Object.values(readJson('gps.json'))));
 
-app.get('/api/equipment', authRequired, (req, res) => res.json(readJson('equipment.json')));
-app.post('/api/equipment', authRequired, roleRequired('admin'), (req, res) => {
-  const equipment = readJson('equipment.json');
-  const item = { id: uuidv4(), ...req.body, createdAt: new Date().toISOString() };
-  equipment.unshift(item); writeJson('equipment.json', equipment); res.status(201).json(item);
+app.get('/api/dashboard/summary', authRequired, roleRequired('admin'), (req, res) => {
+  const trips = readJson('trips.json').filter(t => t.status === 'completed');
+  const expenses = readJson('expenses.json');
+  const startOfDay = new Date(); startOfDay.setHours(0,0,0,0);
+  const startOfWeek = new Date(); startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay()); startOfWeek.setHours(0,0,0,0);
+  const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  const sumTrips = list => list.reduce((s,t)=>s+Number(t.priceBreakdown?.total || 0),0);
+  const sumExpenses = list => list.reduce((s,x)=>s+Number(x.amount || 0),0);
+  const byDate = d => trips.filter(t => new Date(t.pickupDate || t.createdAt) >= d);
+  const exByDate = d => expenses.filter(x => new Date(x.expenseDate || x.createdAt) >= d);
+  const expensesByUser = Object.values(expenses.reduce((acc,e)=>{ const key=e.userName||'Unknown'; acc[key]=acc[key]||{userName:key,total:0}; acc[key].total+=Number(e.amount||0); return acc; }, {}));
+  const vehicleMileage = Object.values(trips.reduce((acc,t)=>{ const key=t.vehicleUnit||'Unassigned Vehicle'; acc[key]=acc[key]||{vehicleUnit:key,mileage:0}; acc[key].mileage+=Number(t.googleMileage || t.mileage || 0); return acc; }, {}));
+  res.json({
+    gross: { daily: sumTrips(byDate(startOfDay)), weekly: sumTrips(byDate(startOfWeek)), monthly: sumTrips(byDate(startOfMonth)) },
+    expenses: { daily: sumExpenses(exByDate(startOfDay)), weekly: sumExpenses(exByDate(startOfWeek)), monthly: sumExpenses(exByDate(startOfMonth)), byUser: expensesByUser },
+    net: { daily: sumTrips(byDate(startOfDay))-sumExpenses(exByDate(startOfDay)), weekly: sumTrips(byDate(startOfWeek))-sumExpenses(exByDate(startOfWeek)), monthly: sumTrips(byDate(startOfMonth))-sumExpenses(exByDate(startOfMonth)) },
+    vehicleMileage
+  });
 });
 
 app.get('/api/expenses', authRequired, (req, res) => {
   const expenses = readJson('expenses.json');
-  if (['driver', 'contractor_driver'].includes(req.user.role)) return res.json(expenses.filter(x => x.userId === req.user.id));
-  res.json(expenses);
+  res.json(['driver','contractor_driver'].includes(req.user.role) ? expenses.filter(e => e.userId === req.user.id) : expenses);
 });
 app.post('/api/expenses', authRequired, upload.single('receipt'), async (req, res) => {
-  const expenses = readJson('expenses.json');
-  const receipt = req.file ? await buildStoredFile(req.file) : null;
-  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, description: req.body.description, expenseDate: req.body.expenseDate, amount: Number(req.body.amount || 0), receipt, createdAt: new Date().toISOString() };
-  expenses.unshift(item); writeJson('expenses.json', expenses); res.status(201).json(item);
+  const category = String(req.body.category || 'Other');
+  if (category === 'Maintenance' && !req.body.note) return res.status(400).json({ error: 'Maintenance note required' });
+  if (category === 'Other' && !req.body.otherText) return res.status(400).json({ error: 'Other text required' });
+  const receipt = req.file ? await storeUploaded(req.file) : null;
+  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, category, otherText: req.body.otherText || '', note: req.body.note || '', expenseDate: req.body.expenseDate, amount: Number(req.body.amount || 0), receipt, createdAt: nowIso() };
+  const expenses = readJson('expenses.json'); expenses.unshift(item); writeJson('expenses.json', expenses); res.status(201).json(item);
 });
 
-app.get('/api/incidents', authRequired, (req, res) => {
-  const incidents = readJson('incidents.json');
-  if (['driver', 'contractor_driver'].includes(req.user.role)) return res.json(incidents.filter(i => i.userId === req.user.id));
-  res.json(incidents);
-});
+app.get('/api/incidents', authRequired, (req, res) => res.json(readJson('incidents.json')));
 app.post('/api/incidents', authRequired, upload.array('images', 4), async (req, res) => {
-  const incidents = readJson('incidents.json');
-  const images = [];
-  for (const file of (req.files || [])) images.push(await buildStoredFile(file));
-  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, tripId: req.body.tripId || '', category: req.body.category, summary: req.body.summary, details: req.body.details, images, createdAt: new Date().toISOString() };
-  incidents.unshift(item); writeJson('incidents.json', incidents); res.status(201).json(item);
+  const files = [];
+  for (const file of req.files || []) files.push(await storeUploaded(file));
+  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, whatToReport: req.body.whatToReport, passengerNames: req.body.passengerNames, witnessNames: req.body.witnessNames, driverContact: req.body.driverContact, eventDate: req.body.eventDate, eventTime: req.body.eventTime, location: req.body.location, weather: req.body.weather, description: req.body.description, damagesInjuries: req.body.damagesInjuries, correctiveAction: req.body.correctiveAction || '', images: files, createdAt: nowIso() };
+  const incidents = readJson('incidents.json'); incidents.unshift(item); writeJson('incidents.json', incidents); res.status(201).json(item);
 });
 
 app.get('/api/inspections', authRequired, (req, res) => res.json(readJson('inspections.json')));
 app.post('/api/inspections', authRequired, upload.array('images', 6), async (req, res) => {
-  const inspections = readJson('inspections.json');
   const images = [];
-  for (const file of (req.files || [])) images.push(await buildStoredFile(file));
-  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, vehicleUnit: req.body.vehicleUnit, odometer: req.body.odometer, tires: req.body.tires, brakes: req.body.brakes, lights: req.body.lights, ramp: req.body.ramp, notes: req.body.notes, images, createdAt: new Date().toISOString() };
-  inspections.unshift(item); writeJson('inspections.json', inspections); res.status(201).json(item);
+  for (const file of req.files || []) images.push(await storeUploaded(file));
+  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, date: req.body.date, time: req.body.time, vehicleNumber: req.body.vehicleNumber, odometerReading: req.body.odometerReading, brakes: req.body.brakes, tires: req.body.tires, steering: req.body.steering, lights: req.body.lights, fluidLevels: req.body.fluidLevels, wheelchairLift: req.body.wheelchairLift, rampCondition: req.body.rampCondition, liftInterlock: req.body.liftInterlock, securementSystem: req.body.securementSystem, seatBelts: req.body.seatBelts, seatCondition: req.body.seatCondition, mirrors: req.body.mirrors, wipers: req.body.wipers, horn: req.body.horn, tieDowns: req.body.tieDowns, interiorCleanliness: req.body.interiorCleanliness, exteriorSafety: req.body.exteriorSafety, defects: req.body.defects, correctiveActionTaken: req.body.correctiveActionTaken, images, createdAt: nowIso() };
+  const all = readJson('inspections.json'); all.unshift(item); writeJson('inspections.json', all); res.status(201).json(item);
 });
 
-app.get('/api/notifications', authRequired, (req, res) => res.json(readJson('notifications.json').filter(n => n.userId === req.user.id)));
-app.post('/api/notifications/:id/read', authRequired, (req, res) => {
-  const notifications = readJson('notifications.json');
-  const idx = notifications.findIndex(n => n.id === req.params.id && n.userId === req.user.id);
-  if (idx !== -1) notifications[idx].read = true;
-  writeJson('notifications.json', notifications); res.json({ ok: true });
+app.get('/api/equipment', authRequired, (req, res) => res.json(readJson('equipment.json')));
+app.post('/api/equipment', authRequired, roleRequired('admin'), (req, res) => { const all = readJson('equipment.json'); const item = { id: uuidv4(), ...req.body, createdAt: nowIso() }; all.unshift(item); writeJson('equipment.json', all); res.status(201).json(item); });
+
+app.get('/api/messages', authRequired, (req, res) => {
+  const all = readJson('messages.json');
+  const visible = all.filter(m => !m.recipientIds?.length || m.recipientIds.includes(req.user.id) || m.userId === req.user.id);
+  res.json(visible.slice(0, 300));
 });
-app.get('/api/messages', authRequired, (req, res) => res.json(readJson('messages.json').slice(0, 200)));
 app.post('/api/messages', authRequired, (req, res) => {
-  const messages = readJson('messages.json');
-  const message = { id: uuidv4(), userId: req.user.id, userName: req.user.name, role: req.user.role, text: req.body.text, createdAt: new Date().toISOString() };
-  messages.unshift(message); writeJson('messages.json', messages.slice(0, 500)); io.emit('chat:message', message); res.status(201).json(message);
+  const recipientIds = Array.isArray(req.body.recipientIds) ? req.body.recipientIds : [];
+  const item = { id: uuidv4(), userId: req.user.id, userName: req.user.name, role: req.user.role, text: req.body.text, recipientIds, createdAt: nowIso() };
+  const all = readJson('messages.json'); all.unshift(item); writeJson('messages.json', all.slice(0, 1000));
+  if (recipientIds.length) recipientIds.forEach(id => io.to(id).emit('message:new', item)); else io.emit('message:new', item);
+  res.status(201).json(item);
 });
+
+function upcomingAppointmentReminders() {
+  const trips = readJson('trips.json');
+  const now = new Date(); let changed = false;
+  trips.forEach(t => {
+    if (['completed','cancelled'].includes(t.status) || t.remindedAt) return;
+    const at = new Date(`${t.pickupDate}T${t.pickupTime || '00:00'}:00`);
+    const diff = at - now;
+    if (diff <= 60 * 60 * 1000 && diff >= 0) {
+      createNotification([...(t.assignedDriverIds || []), ...readJson('users.json').filter(u => ['admin','dispatcher'].includes(u.role)).map(u => u.id)], 'Appointment Reminder', `${t.tripNumber} pickup in less than 1 hour`, 'appointment', { tripId: t.id });
+      t.remindedAt = nowIso(); changed = true;
+    }
+  });
+  if (changed) writeJson('trips.json', trips);
+}
+setInterval(upcomingAppointmentReminders, 60000);
 
 io.use((socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error('Missing token'));
-    const payload = jwt.verify(token, JWT_SECRET);
-    const user = readJson('users.json').find(u => u.id === payload.userId);
-    if (!user) return next(new Error('Invalid user'));
-    socket.user = { id: user.id, name: user.name, role: user.role };
-    next();
-  } catch (err) { next(new Error('Unauthorized')); }
+    if (!token) return next(new Error('auth')); const payload = jwt.verify(token, JWT_SECRET);
+    const user = readJson('users.json').find(u => u.id === payload.userId); if (!user) return next(new Error('auth'));
+    socket.user = user; next();
+  } catch { next(new Error('auth')); }
 });
 io.on('connection', socket => {
   onlineUsers.set(socket.user.id, socket.id); socket.join(socket.user.id); io.emit('presence:update', Array.from(onlineUsers.keys()));
