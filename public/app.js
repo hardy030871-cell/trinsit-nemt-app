@@ -585,3 +585,13 @@ window.deleteUser = async id=>{ if(!confirm('Permanently delete this user accoun
 render(); if(state.token) bootstrap();
 
 function removeCommissionRow(btn){ btn.closest('.commission-row')?.remove(); }
+
+function handleTripAction(tripId, action){
+  fetch('/api/trip/update',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ tripId, action })
+  })
+  .then(res=>res.json())
+  .then(()=> location.reload());
+}
