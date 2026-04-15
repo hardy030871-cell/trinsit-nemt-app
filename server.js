@@ -644,3 +644,32 @@ io.on('connection', socket => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 server.listen(PORT, '0.0.0.0', () => console.log(`TRINSIT app running on port ${PORT}`));
+app.post('/api/trips/:id/status', (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  try {
+    const trips = JSON.parse(fs.readFileSync('data/trips.json', 'utf8'));
+
+    const trip = trips.find(t => t.id === id);
+    if (!trip) return res.status(404).json({ error: 'Trip not found' });
+
+    // Update status
+    trip.status = status;
+
+    // Add log
+    if (!trip.tripLogs) trip.tripLogs = [];
+    trip.tripLogs.push({
+      status,
+      user: 'Driver',
+      time: new Date().toISOString()
+    });
+
+    fs.writeFileSync('data/trips.json', JSON.stringify(trips, null, 2));
+
+    res.json({ success: true, trip });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
