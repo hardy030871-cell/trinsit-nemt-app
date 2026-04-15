@@ -673,3 +673,34 @@ app.post('/api/trips/:id/status', (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post('/api/trips/:id/facesheet', (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const trips = JSON.parse(fs.readFileSync('data/trips.json', 'utf8'));
+
+    const trip = trips.find(t => t.id === id);
+    if (!trip) return res.status(404).json({ error: 'Trip not found' });
+
+    if (!trip.facesheetFiles) trip.facesheetFiles = [];
+
+    trip.facesheetFiles.push({
+      name: 'facesheet',
+      time: new Date().toISOString()
+    });
+
+    if (!trip.tripLogs) trip.tripLogs = [];
+    trip.tripLogs.push({
+      status: 'facesheet_uploaded',
+      user: 'Driver',
+      time: new Date().toISOString()
+    });
+
+    fs.writeFileSync('data/trips.json', JSON.stringify(trips, null, 2));
+
+    res.json({ success: true, trip });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
