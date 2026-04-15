@@ -1,3 +1,14 @@
+function getStepState(trip) {
+  const log = trip.log || [];
+
+  return {
+    inProgress: log.some(l => l.action === 'in_progress'),
+    arrived: log.some(l => l.action === 'arrived'),
+    facesheet: log.some(l => l.action === 'facesheet_uploaded'),
+    leaving: log.some(l => l.action === 'leaving'),
+    completed: log.some(l => l.action === 'completed')
+  };
+}
 const state = {
   token: localStorage.getItem('trinsit_token') || '',
   user: JSON.parse(localStorage.getItem('trinsit_user') || 'null'),
