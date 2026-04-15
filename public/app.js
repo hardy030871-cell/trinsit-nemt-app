@@ -266,23 +266,58 @@ function tripTable(trips){
 }
 function tripStatusActions(trip){
   if(!roleIs('driver','contractor_driver')) return '';
+
   const hasFacesheet = (trip.facesheetFiles||[]).length > 0;
+
+  // Define steps
   const steps = [
-    ['trip_in_progress','Trip In Progress'],
-    ['arrived_pickup','Arrived for Pick Up'],
-    ['upload','Upload Facesheet'],
-    ['leaving_with_patient','Leaving With Patient'],
-    ['completed','Trip Completed']
+    { key:'trip_in_progress', label:'Trip In Progress' },
+    { key:'arrived_pickup', label:'Arrived for Pick Up' },
+    { key:'facesheet', label:'Upload Facesheet' },
+    { key:'leaving_with_patient', label:'Leaving With Patient' },
+    { key:'completed', label:'Trip Completed' }
   ];
-  const currentIndex = ({assigned:0,trip_in_progress:1,arrived_pickup:2,leaving_with_patient:4,completed:5})[trip.status] || 0;
-  return `<div class="progress-vertical">${steps.map((step, idx)=>{
-    if(step[0]==='upload') return `<label class="progress-step ${hasFacesheet?'done':''} ${currentIndex>=2?'current':''}"><span class="step-dot"></span><span class="step-label">Upload Facesheet</span><input type="file" accept="image/*,.pdf" onchange="uploadFacesheet('${trip.id}', this.files[0])"></label>`;
-    const idxMap = {trip_in_progress:1,arrived_pickup:2,leaving_with_patient:4,completed:5};
-    const stepIndex = idxMap[step[0]];
-    const disabled = step[0]==='leaving_with_patient' ? (!hasFacesheet || currentIndex!==2) : step[0]==='completed' ? currentIndex!==4 : currentIndex!==stepIndex-1;
-    const done = currentIndex>=stepIndex;
-    return `<button class="progress-step-btn ${done?'done':''} ${disabled?'locked':''}" ${disabled?'disabled':''} onclick="advanceTrip('${trip.id}','${step[0]}')"><span class="step-dot"></span><span class="step-label">${step[1]}</span></button>`;
-  }).join('')}</div>`;
+
+  // Current position
+  let currentIndex = 0;
+
+  if(trip.status === 'trip_in_progress') currentIndex = 1;
+  if(trip.status === 'arrived_pickup') currentIndex = 2;
+  if(hasFacesheet) currentIndex = 3;
+  if(trip.status === 'leaving_with_patient') currentIndex = 4;
+  if(trip.status === 'completed') currentIndex = 5;
+
+  // Build UI
+  return steps.map((step, i) => {
+
+    let disabled = true;
+
+    // Enable ONLY next step
+    if(step.key === 'facesheet'){
+      disabled = !(trip.status === 'arrived_pickup' && !hasFacesheet);
+    } else {
+      disabled = !(i === currentIndex);
+    }
+
+    return `
+      <div class="trip-step ${disabled ? 'disabled' : 'active'}">
+        ${
+          step.key === 'facesheet'
+          ? `
+            <label class="facesheet-upload">
+              <input type="file" onchange="uploadFacesheet('${trip.id}', this)">
+              Upload Facesheet
+            </label>
+          `
+          : `
+            <button onclick="handleTripAction('${trip.id}','${step.key}')" ${disabled ? 'disabled' : ''}>
+              ${step.label}
+            </button>
+          `
+        }
+      </div>
+    `;
+  }).join('');
 }
 function tripsView(){
   const payerOptions = state.data.payers.map(p=>`<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
