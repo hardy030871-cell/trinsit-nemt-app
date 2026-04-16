@@ -108,10 +108,10 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static(UPLOADS_DIR));
-app.use(express.static(PUBLIC_DIR));
+.use(express.json({ limit: '10mb' }));
+.use(express.urlencoded({ extended: true }));
+.use('/uploads', express.static(UPLOADS_DIR));
+.use(express.static(PUBLIC_DIR));
 
 function makeToken(user) {
   return Buffer.from(`${user.id}|${user.role}|${Date.now()}`).toString('base64url');
@@ -156,11 +156,21 @@ function currentAttendance(userId) {
 
 app.post('/api/login', (req, res) => {
   const { pin } = req.body;
-  const users = readJson(FILES.users, []);
-  const user = users.find(u => u.pin === pin && u.active);
-  if (!user) return res.status(401).json({ error: 'Invalid PIN' });
-  const token = makeToken(user);
-  res.json({ token, user: sanitizeUser(user) });
+
+  try {
+    const users = JSON.parse(fs.readFileSync('data/users.json', 'utf8'));
+
+    const user = users.find(u => u.pin === pin);
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid PIN' });
+    }
+
+    res.json({ success: true, user });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/bootstrap', auth, (req, res) => {
