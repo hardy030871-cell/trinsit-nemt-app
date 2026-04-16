@@ -543,5 +543,41 @@ window.deleteUser = async id=>{ if(!confirm('Permanently delete this user accoun
 
 
 render(); if(state.token) bootstrap();
+// ===== DRIVER GPS TRACKING =====
+let watchId = null;
+
+function startDriverTracking() {
+  const driverId = "driver_001";
+
+  if (!navigator.geolocation) {
+    alert("GPS not supported");
+    return;
+  }
+
+  watchId = navigator.geolocation.watchPosition(
+    async (pos) => {
+      const payload = {
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        timestamp: new Date().toISOString()
+      };
+
+      await fetch(`/api/drivers/${driverId}/location`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      console.log("GPS sent:", payload);
+    },
+    (err) => console.error(err),
+    {
+      enableHighAccuracy: true,
+      maximumAge: 0
+    }
+  );
+}
 
 function removeCommissionRow(btn){ btn.closest('.commission-row')?.remove(); }
