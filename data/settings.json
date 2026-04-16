@@ -1,0 +1,16 @@
+{
+  "payers": [
+    "Private Pay",
+    "Medicaid",
+    "VA",
+    "Facility Contract"
+  ],
+  "featureFlags": {
+    "chat": true,
+    "liveMap": true,
+    "expenses": true,
+    "equipment": true,
+    "driverTwoAssignment": true,
+    "commissionMode": true
+  }
+}
