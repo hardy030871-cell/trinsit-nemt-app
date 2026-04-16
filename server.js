@@ -49,7 +49,7 @@ function readJson(file, fallback) {
 
 function seed() {
   const defaultUsers = [
-    { id: 'u-admin', name: 'TRINSIT Admin', role: 'admin', pin: '001900!', active: true, contractorPermission: true, phone: '', address: '', dob: '', status: 'available', createdAt: new Date().toISOString() },
+    { id: 'u-admin', name: 'TRINSIT Admin', role: 'admin', pin: '002100!', active: true, contractorPermission: true, phone: '', address: '', dob: '', status: 'available', createdAt: new Date().toISOString() },
     { id: 'u-dispatch', name: 'Dispatcher One', role: 'dispatcher', pin: '222222!', active: true, contractorPermission: false, phone: '', address: '', dob: '', status: 'available', createdAt: new Date().toISOString() },
     { id: 'u-driver', name: 'Driver One', role: 'driver', pin: '333333!', active: true, contractorPermission: false, phone: '', address: '', dob: '', status: 'off_duty', createdAt: new Date().toISOString() },
     { id: 'u-contractor', name: 'Contractor One', role: 'contractor_driver', pin: '444444!', active: true, contractorPermission: true, phone: '', address: '', dob: '', status: 'off_duty', createdAt: new Date().toISOString() }
