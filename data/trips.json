@@ -1,0 +1,60 @@
+[
+  {
+    "id": "TRIP-000001",
+    "pickupTime": "2026-04-16T10:45:02.873Z",
+    "patientName": "John Carter",
+    "pickupLocation": "123 Main St, Ocala, FL",
+    "dropoffLocation": "Munroe Regional Medical Center, Ocala, FL",
+    "service": "Wheelchair",
+    "weight": "185",
+    "oxygen": "No",
+    "otherStop": "",
+    "payer": "Private Pay",
+    "mileage": "8.2",
+    "status": "completed",
+    "driverIds": [
+      "u-driver"
+    ],
+    "tripLogs": [
+      {
+        "status": "assigned",
+        "at": "2026-04-16T09:45:02.873Z",
+        "by": "u-dispatch"
+      },
+      {
+        "status": "trip_in_progress",
+        "at": "2026-04-16T09:55:17.180Z",
+        "by": "u-driver"
+      },
+      {
+        "status": "arrived_pickup",
+        "at": "2026-04-16T09:55:22.552Z",
+        "by": "u-driver"
+      },
+      {
+        "status": "facesheet_uploaded",
+        "at": "2026-04-16T09:55:43.266Z",
+        "by": "u-driver"
+      },
+      {
+        "status": "leaving_with_patient",
+        "at": "2026-04-16T09:55:49.314Z",
+        "by": "u-driver"
+      },
+      {
+        "status": "completed",
+        "at": "2026-04-16T09:55:52.897Z",
+        "by": "u-driver"
+      }
+    ],
+    "facesheetFiles": [
+      {
+        "id": "f0c509ec-188d-4a8f-8bfd-7c44553f6941",
+        "file": "/uploads/1776333343258-Admin_Panel.png",
+        "at": "2026-04-16T09:55:43.266Z",
+        "by": "u-driver"
+      }
+    ],
+    "createdAt": "2026-04-16T09:45:02.873Z"
+  }
+]
