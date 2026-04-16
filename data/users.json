@@ -1,1 +1,26 @@
-
+[
+  {
+    "id": "1",
+    "name": "Admin",
+    "pin": "001900!",
+    "role": "admin"
+  },
+  {
+    "id": "2",
+    "name": "Dispatcher",
+    "pin": "222222!",
+    "role": "dispatcher"
+  },
+  {
+    "id": "3",
+    "name": "Driver One",
+    "pin": "333333!",
+    "role": "driver"
+  },
+  {
+    "id": "4",
+    "name": "Contractor One",
+    "pin": "444444!",
+    "role": "contractor_driver"
+  }
+]
