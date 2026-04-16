@@ -7,6 +7,37 @@ let drivers = [
   }
 ];
 
+// DRIVER LOCATION UPDATE
+app.post("/api/drivers/:driverId/location", (req, res) => {
+  const { driverId } = req.params;
+  const { lat, lng, timestamp } = req.body;
+
+  const driver = drivers.find(d => d.id === driverId);
+
+  if (!driver) {
+    return res.status(404).json({ ok: false });
+  }
+
+  driver.location = {
+    lat,
+    lng,
+    timestamp: timestamp || new Date().toISOString()
+  };
+
+  res.json({ ok: true });
+});
+
+// GET DRIVER LOCATION
+app.get("/api/drivers/:driverId/location", (req, res) => {
+  const driver = drivers.find(d => d.id === req.params.driverId);
+
+  if (!driver) {
+    return res.status(404).json({ ok: false });
+  }
+
+  res.json({ ok: true, location: driver.location });
+});
+
 // ADD THIS SECTION BELOW YOUR OTHER API ROUTES
 
 app.post("/api/drivers/:driverId/location", (req, res) => {
