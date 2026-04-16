@@ -82,7 +82,7 @@ function renderLogin(){
         <h1>PIN Login</h1>
         <p>Enter your 6-digit PIN and special symbol.</p>
         <form id="loginForm" class="stack">
-          <input name="pin" placeholder="001900!" required />
+          <input name="pin" placeholder="000000!" required />
           <button>Login</button>
         </form>
       </div>
