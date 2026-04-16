@@ -1,3 +1,47 @@
+// Add this at the top if not already
+let drivers = [
+  {
+    id: "driver_001",
+    name: "Driver One",
+    location: null
+  }
+];
+
+// ADD THIS SECTION BELOW YOUR OTHER API ROUTES
+
+app.post("/api/drivers/:driverId/location", (req, res) => {
+  const { driverId } = req.params;
+  const { lat, lng, heading, speed, accuracy, timestamp } = req.body;
+
+  const driver = drivers.find((d) => d.id === driverId);
+
+  if (!driver) {
+    return res.status(404).json({ ok: false, message: "Driver not found" });
+  }
+
+  driver.location = {
+    lat,
+    lng,
+    heading,
+    speed,
+    accuracy,
+    timestamp: timestamp || new Date().toISOString()
+  };
+
+  res.json({ ok: true, location: driver.location });
+});
+
+app.get("/api/drivers/:driverId/location", (req, res) => {
+  const { driverId } = req.params;
+
+  const driver = drivers.find((d) => d.id === driverId);
+
+  if (!driver) {
+    return res.status(404).json({ ok: false });
+  }
+
+  res.json({ ok: true, location: driver.location });
+});
 const express = require('express');
 const http = require('http');
 const path = require('path');
