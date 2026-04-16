@@ -1,0 +1,22 @@
+[
+  {
+    "id": "b5c34dda-89a4-47bc-b596-6ad0bf46f12b",
+    "name": "Wheelchair",
+    "required": true
+  },
+  {
+    "id": "febc6adb-03f5-4a9b-bfa1-afd171e6b872",
+    "name": "Oxygen Tank",
+    "required": true
+  },
+  {
+    "id": "ebe2e3ca-9973-4e1d-a7be-be53a1bfe9b4",
+    "name": "First Aid Kit",
+    "required": true
+  },
+  {
+    "id": "e89aae22-5133-437c-96a2-1be546057bd3",
+    "name": "Stair Chair",
+    "required": false
+  }
+]
