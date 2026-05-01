@@ -26,6 +26,19 @@
     "createdAt": "2026-04-16T09:45:02.873Z"
   },
   {
+    "id": "u-manager",
+    "name": "Manager One",
+    "role": "manager",
+    "pin": "555555!",
+    "active": true,
+    "contractorPermission": false,
+    "phone": "",
+    "address": "",
+    "dob": "",
+    "status": "available",
+    "createdAt": "2026-04-16T09:45:02.873Z"
+  },
+  {
     "id": "u-driver",
     "name": "Driver One",
     "role": "driver",
