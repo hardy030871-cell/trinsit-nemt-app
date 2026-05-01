@@ -36,6 +36,7 @@ const FILES = {
 const DEFAULT_USERS = [
   { id: 'u-admin', name: 'TRINSIT Admin', role: 'admin', pin: '001900!', active: true, contractorPermission: true, phone: '', address: '', dob: '', status: 'available' },
   { id: 'u-dispatch', name: 'Dispatcher One', role: 'dispatcher', pin: '222222!', active: true, contractorPermission: false, phone: '', address: '', dob: '', status: 'available' },
+  { id: 'u-manager', name: 'Manager One', role: 'manager', pin: '555555!', active: true, contractorPermission: false, phone: '', address: '', dob: '', status: 'available' },
   { id: 'u-driver', name: 'Driver One', role: 'driver', pin: '333333!', active: true, contractorPermission: false, phone: '', address: '', dob: '', status: 'off_duty' },
   { id: 'u-contractor', name: 'Contractor One', role: 'contractor_driver', pin: '444444!', active: true, contractorPermission: true, phone: '', address: '', dob: '', status: 'off_duty' }
 ];
@@ -82,10 +83,10 @@ function repairDefaultUsers() {
     const repaired = {
       ...defaultUser,
       ...existing,
-      role: defaultUser.role,
-      pin: normalizePin(defaultUser.pin),
-      active: true,
-      contractorPermission: defaultUser.contractorPermission,
+      pin: normalizePin(existing.pin || defaultUser.pin),
+      role: existing.role || defaultUser.role,
+      active: existing.active !== false,
+      contractorPermission: existing.contractorPermission ?? defaultUser.contractorPermission,
       createdAt: existing.createdAt || now
     };
     if (JSON.stringify(existing) !== JSON.stringify(repaired)) {
@@ -149,7 +150,21 @@ function seed() {
   const chatSeed = readJson(FILES.chat, { channels: [], direct: [] });
   if (!chatSeed || typeof chatSeed !== 'object' || !Array.isArray(chatSeed.direct) || !Array.isArray(chatSeed.channels)) writeJson(FILES.chat, { channels: [], direct: [] });
   const settingsSeed = readJson(FILES.settings, defaultSettings);
-  if (!settingsSeed || typeof settingsSeed !== 'object' || !Array.isArray(settingsSeed.payers)) writeJson(FILES.settings, defaultSettings);
+  if (!settingsSeed || typeof settingsSeed !== 'object' || !Array.isArray(settingsSeed.payers)) {
+    writeJson(FILES.settings, defaultSettings);
+  } else {
+    const mergedSettings = {
+      ...defaultSettings,
+      ...settingsSeed,
+      featureFlags: { ...defaultSettings.featureFlags, ...(settingsSeed.featureFlags || {}) },
+      payers: Array.isArray(settingsSeed.payers) ? settingsSeed.payers : defaultSettings.payers,
+      chatVisibleUserIds: Array.isArray(settingsSeed.chatVisibleUserIds) ? settingsSeed.chatVisibleUserIds : [],
+      customTripFields: Array.isArray(settingsSeed.customTripFields) ? settingsSeed.customTripFields : defaultSettings.customTripFields,
+      inspectionExtraFields: Array.isArray(settingsSeed.inspectionExtraFields) ? settingsSeed.inspectionExtraFields : [],
+      incidentExtraFields: Array.isArray(settingsSeed.incidentExtraFields) ? settingsSeed.incidentExtraFields : []
+    };
+    writeJson(FILES.settings, mergedSettings);
+  }
   const liveSeed = readJson(FILES.live, {});
   if (!liveSeed || typeof liveSeed !== 'object' || Array.isArray(liveSeed)) writeJson(FILES.live, {});
 }
@@ -213,6 +228,13 @@ function pruneLiveLocations(live) {
     return Number.isFinite(seenAt) && seenAt >= cutoff;
   }));
 }
+
+function parseJsonField(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
 
 function listUploadedFilesForDay(day) {
   const target = day || new Date().toISOString().slice(0,10);
@@ -422,8 +444,9 @@ app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, 
     payer: body.payer || '',
     notes: body.notes || '',
     mileage: body.mileage || '',
+    customFields: body.customFields && typeof body.customFields === 'object' ? body.customFields : {},
     status: 'assigned',
-    driverIds: body.driverIds || [],
+    driverIds: Array.isArray(body.driverIds) ? [...new Set(body.driverIds)].slice(0,2) : [],
     tripLogs: [{ status: 'assigned', at: new Date().toISOString(), by: req.user.id }],
     facesheetFiles: [],
     createdAt: new Date().toISOString()
@@ -460,6 +483,7 @@ app.post('/api/trips/assign', auth, requireRole('admin','dispatcher','manager'),
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
   trip.driverIds = Array.isArray(driverIds) ? [...new Set(driverIds)].slice(0, 2) : [];
   trip.status = trip.status === 'cancelled' ? 'assigned' : trip.status;
+  trip.tripLogs = trip.tripLogs || [];
   trip.tripLogs.push({ status: 'assigned', at: new Date().toISOString(), by: req.user.id, driverIds: trip.driverIds });
   writeJson(FILES.trips, trips);
   io.emit('trip:assigned', trip);
@@ -475,6 +499,7 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
   const isOps = ['admin','dispatcher','manager'].includes(req.user.role);
   if (!isOps && !(trip.driverIds || []).includes(req.user.id)) return res.status(403).json({ error: 'Trip not assigned to you' });
+  if (!isOps && !currentAttendance(req.user.id)) return res.status(409).json({ error: 'Clock in before updating trip progress' });
   if (!isOps && ['cancelled','on_hold'].includes(status)) return res.status(403).json({ error: 'Only admin/manager/dispatch can cancel or hold trips' });
   trip.status = status;
   trip.tripLogs = trip.tripLogs || [];
@@ -490,8 +515,10 @@ app.post('/api/trips/:id/facesheet', auth, upload.single('file'), (req, res) => 
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
   const isOps = ['admin','dispatcher','manager'].includes(req.user.role);
   if (!isOps && !(trip.driverIds || []).includes(req.user.id)) return res.status(403).json({ error: 'Trip not assigned to you' });
+  if (!req.file) return res.status(400).json({ error: 'Facesheet file is required' });
   trip.facesheetFiles = trip.facesheetFiles || [];
   trip.facesheetFiles.push({ id: uuidv4(), file: `/uploads/${req.file.filename}`, at: new Date().toISOString(), by: req.user.id });
+  trip.tripLogs = trip.tripLogs || [];
   trip.tripLogs.push({ status: 'facesheet_uploaded', at: new Date().toISOString(), by: req.user.id });
   writeJson(FILES.trips, trips);
   io.emit('trip:updated', trip);
@@ -602,10 +629,10 @@ app.post('/api/inspections', auth, upload.array('files', 6), (req, res) => {
     time: req.body.time || '',
     vehicleNumber: req.body.vehicleNumber || '',
     odometer: req.body.odometer || '',
-    statuses: req.body.statuses ? JSON.parse(req.body.statuses) : {},
+    statuses: parseJsonField(req.body.statuses, {}),
     defects: req.body.defects || '',
     correctiveAction: req.body.correctiveAction || '',
-    extraData: req.body.extraData ? JSON.parse(req.body.extraData) : {},
+    extraData: parseJsonField(req.body.extraData, {}),
     files,
     createdAt: new Date().toISOString()
   };
@@ -644,7 +671,7 @@ app.post('/api/incidents', auth, upload.array('files', 6), (req, res) => {
     contactInfo: req.body.contactInfo || '',
     description: req.body.description || '',
     damagesInjuries: req.body.damagesInjuries || '',
-    extraData: req.body.extraData ? JSON.parse(req.body.extraData) : {},
+    extraData: parseJsonField(req.body.extraData, {}),
     files,
     createdAt: new Date().toISOString()
   };
