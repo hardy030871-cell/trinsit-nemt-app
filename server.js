@@ -143,7 +143,6 @@ function seed() {
   ensureArrayData(FILES.users, DEFAULT_USERS.map(user => ({ ...user, createdAt: new Date().toISOString() })));
   repairDefaultUsers();
   ensureArrayData(FILES.trips, defaultTrips);
-  repairTripIds();
   ensureArrayData(FILES.attendance, []);
   ensureArrayData(FILES.expenses, []);
   ensureArrayData(FILES.equipment, defaultEquipment);
@@ -171,6 +170,7 @@ function seed() {
   if (!liveSeed || typeof liveSeed !== 'object' || Array.isArray(liveSeed)) writeJson(FILES.live, {});
 }
 seed();
+repairTripIds();
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
@@ -249,53 +249,33 @@ function requireRole(...roles) {
   };
 }
 
-function tripIdNumber(id) {
+function numericTripId(id) {
   const match = String(id || '').match(/^TRIP-(\d+)$/);
-  return match ? Number(match[1]) : NaN;
+  return match ? Number(match[1]) : 0;
 }
-
 function nextTripId(trips) {
-  const max = trips.reduce((m, t) => {
-    const n = tripIdNumber(t.id);
-    return Number.isFinite(n) ? Math.max(m, n) : m;
-  }, 0);
+  const max = Array.isArray(trips) ? trips.reduce((m, t) => Math.max(m, numericTripId(t.id)), 0) : 0;
   return `TRIP-${String(max + 1).padStart(6, '0')}`;
 }
-
-function sortTripsNewestFirst(trips) {
-  return [...trips].sort((a, b) => {
-    const ad = new Date(a.createdAt || a.pickupTime || 0).getTime();
-    const bd = new Date(b.createdAt || b.pickupTime || 0).getTime();
-    return bd - ad;
-  });
-}
-
 function repairTripIds() {
   const trips = readJson(FILES.trips, []);
   if (!Array.isArray(trips)) return;
   const used = new Set();
+  let max = trips.reduce((m, t) => Math.max(m, numericTripId(t.id)), 0);
   let changed = false;
-
-  const sorted = sortTripsNewestFirst(trips);
-  let max = trips.reduce((m, t) => {
-    const n = tripIdNumber(t.id);
-    return Number.isFinite(n) ? Math.max(m, n) : m;
-  }, 0);
-
-  for (const trip of sorted) {
-    const valid = Number.isFinite(tripIdNumber(trip.id));
-    if (!valid || used.has(trip.id)) {
-      const oldId = trip.id;
+  for (const trip of trips) {
+    const n = numericTripId(trip.id);
+    if (!n || used.has(trip.id)) {
       max += 1;
       trip.id = `TRIP-${String(max).padStart(6, '0')}`;
-      trip.previousId = oldId || '';
-      trip.tripLogs = trip.tripLogs || [];
-      trip.tripLogs.push({ status: 'system_id_repaired', at: new Date().toISOString(), by: 'system', oldId, newId: trip.id });
       changed = true;
     }
     used.add(trip.id);
+    trip.createdAt = trip.createdAt || new Date().toISOString();
+    trip.driverIds = Array.isArray(trip.driverIds) ? trip.driverIds : [];
+    trip.tripLogs = Array.isArray(trip.tripLogs) ? trip.tripLogs : [];
+    trip.facesheetFiles = Array.isArray(trip.facesheetFiles) ? trip.facesheetFiles : [];
   }
-
   if (changed) writeJson(FILES.trips, trips);
 }
 function sanitizeUser(user) {
@@ -377,6 +357,7 @@ app.post('/api/login', (req, res) => {
 
 app.get('/api/bootstrap', auth, (req, res) => {
   const users = readJson(FILES.users, []).map(sanitizeUser);
+  repairTripIds();
   const allTrips = readJson(FILES.trips, []);
   const trips = roleFilterTrips(req.user, allTrips);
   const attendance = readJson(FILES.attendance, []);
@@ -524,24 +505,23 @@ app.get('/api/trips', auth, (req, res) => {
 function getTripProgressState(trip) {
   const logs = trip.tripLogs || [];
   const has = (s) => trip.status === s || logs.some(l => l.status === s || l.action === s || l.type === s);
-  const hasEvidence = Array.isArray(trip.checkpointEvidenceFiles) && trip.checkpointEvidenceFiles.length > 0;
+  const hasFacesheet = Array.isArray(trip.facesheetFiles) && trip.facesheetFiles.length > 0 || has('facesheet_uploaded');
   return {
     inProgressDone: has('trip_in_progress'),
     arrivedDone: has('arrived_pickup'),
+    hasFacesheet,
     leavingDone: has('leaving_with_patient'),
-    completedDone: has('completed'),
-    hasEvidence
+    completedDone: has('completed')
   };
 }
 
 function roleFilterTrips(user, trips) {
-  const visible = ['admin','dispatcher','manager'].includes(user.role)
-    ? trips
-    : trips.filter(t => (t.driverIds || []).includes(user.id));
-  return sortTripsNewestFirst(visible);
+  if (['admin','dispatcher','manager'].includes(user.role)) return trips;
+  return trips.filter(t => (t.driverIds || []).includes(user.id));
 }
 
 app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, res) => {
+  repairTripIds();
   const trips = readJson(FILES.trips, []);
   const body = req.body;
   const trip = {
@@ -633,6 +613,7 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   if (status === 'trip_in_progress') {
     trip.checkpointMeta.tripInProgress = {
       ...(trip.checkpointMeta.tripInProgress || {}),
+      odometerStart: meta.odometerStart || '',
       at: new Date().toISOString(),
       by: req.user.id
     };
@@ -641,6 +622,7 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   if (status === 'arrived_pickup') {
     trip.checkpointMeta.arrivedPickup = {
       ...(trip.checkpointMeta.arrivedPickup || {}),
+      pickupSignatureName: String(meta.pickupSignatureName || '').trim(),
       at: new Date().toISOString(),
       by: req.user.id
     };
@@ -649,6 +631,8 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   if (status === 'completed') {
     trip.checkpointMeta.completed = {
       ...(trip.checkpointMeta.completed || {}),
+      odometerEnd: meta.odometerEnd || '',
+      dropoffSignatureName: String(meta.dropoffSignatureName || '').trim(),
       at: new Date().toISOString(),
       by: req.user.id
     };
@@ -658,7 +642,7 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   trip.tripLogs = trip.tripLogs || [];
   trip.tripLogs.push({ status, at: new Date().toISOString(), by: req.user.id, meta });
   writeJson(FILES.trips, trips);
-  io.emit('trip:updated', { trip, status, byId: req.user.id, byName: req.user.name });
+  io.emit('trip:updated', trip);
   res.json({ trip });
 });
 
