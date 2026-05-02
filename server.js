@@ -143,6 +143,7 @@ function seed() {
   ensureArrayData(FILES.users, DEFAULT_USERS.map(user => ({ ...user, createdAt: new Date().toISOString() })));
   repairDefaultUsers();
   ensureArrayData(FILES.trips, defaultTrips);
+  repairTripIds();
   ensureArrayData(FILES.attendance, []);
   ensureArrayData(FILES.expenses, []);
   ensureArrayData(FILES.equipment, defaultEquipment);
@@ -248,9 +249,54 @@ function requireRole(...roles) {
   };
 }
 
+function tripIdNumber(id) {
+  const match = String(id || '').match(/^TRIP-(\d+)$/);
+  return match ? Number(match[1]) : NaN;
+}
+
 function nextTripId(trips) {
-  const max = trips.reduce((m, t) => Math.max(m, Number((t.id || '').split('-')[1] || 0)), 0);
+  const max = trips.reduce((m, t) => {
+    const n = tripIdNumber(t.id);
+    return Number.isFinite(n) ? Math.max(m, n) : m;
+  }, 0);
   return `TRIP-${String(max + 1).padStart(6, '0')}`;
+}
+
+function sortTripsNewestFirst(trips) {
+  return [...trips].sort((a, b) => {
+    const ad = new Date(a.createdAt || a.pickupTime || 0).getTime();
+    const bd = new Date(b.createdAt || b.pickupTime || 0).getTime();
+    return bd - ad;
+  });
+}
+
+function repairTripIds() {
+  const trips = readJson(FILES.trips, []);
+  if (!Array.isArray(trips)) return;
+  const used = new Set();
+  let changed = false;
+
+  const sorted = sortTripsNewestFirst(trips);
+  let max = trips.reduce((m, t) => {
+    const n = tripIdNumber(t.id);
+    return Number.isFinite(n) ? Math.max(m, n) : m;
+  }, 0);
+
+  for (const trip of sorted) {
+    const valid = Number.isFinite(tripIdNumber(trip.id));
+    if (!valid || used.has(trip.id)) {
+      const oldId = trip.id;
+      max += 1;
+      trip.id = `TRIP-${String(max).padStart(6, '0')}`;
+      trip.previousId = oldId || '';
+      trip.tripLogs = trip.tripLogs || [];
+      trip.tripLogs.push({ status: 'system_id_repaired', at: new Date().toISOString(), by: 'system', oldId, newId: trip.id });
+      changed = true;
+    }
+    used.add(trip.id);
+  }
+
+  if (changed) writeJson(FILES.trips, trips);
 }
 function sanitizeUser(user) {
   const { pin, ...rest } = user;
@@ -477,20 +523,22 @@ app.get('/api/trips', auth, (req, res) => {
 
 function getTripProgressState(trip) {
   const logs = trip.tripLogs || [];
-  const has = (st) => trip.status === st || logs.some(l => l.status === st || l.action === st || l.type === st);
-  const hasFacesheet = Array.isArray(trip.facesheetFiles) && trip.facesheetFiles.length > 0 || has('facesheet_uploaded');
+  const has = (s) => trip.status === s || logs.some(l => l.status === s || l.action === s || l.type === s);
+  const hasEvidence = Array.isArray(trip.checkpointEvidenceFiles) && trip.checkpointEvidenceFiles.length > 0;
   return {
     inProgressDone: has('trip_in_progress'),
     arrivedDone: has('arrived_pickup'),
     leavingDone: has('leaving_with_patient'),
     completedDone: has('completed'),
-    hasFacesheet
+    hasEvidence
   };
 }
 
 function roleFilterTrips(user, trips) {
-  if (['admin','dispatcher','manager'].includes(user.role)) return trips;
-  return trips.filter(t => (t.driverIds || []).includes(user.id));
+  const visible = ['admin','dispatcher','manager'].includes(user.role)
+    ? trips
+    : trips.filter(t => (t.driverIds || []).includes(user.id));
+  return sortTripsNewestFirst(visible);
 }
 
 app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, res) => {
@@ -507,8 +555,6 @@ app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, 
     roomNumber: body.roomNumber || '',
     oxygen: body.oxygen,
     oxygenLiters: body.oxygenLiters || '',
-    caregiver: body.caregiver || '',
-    hasStop: body.hasStop || '',
     caregiverCount: body.caregiverCount || '',
     otherStop: body.otherStop || '',
     payer: body.payer || '',
@@ -578,15 +624,41 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   const p = getTripProgressState(trip);
   if (status === 'arrived_pickup' && !p.inProgressDone) return res.status(409).json({ error: 'Trip must be in progress first' });
   if (status === 'leaving_with_patient' && !p.arrivedDone) return res.status(409).json({ error: 'Mark arrived before leaving with patient' });
-  if (status === 'completed' && !p.leavingDone) return res.status(409).json({ error: 'Mark leaving with patient before completion' });
+  if (status === 'completed') {
+    if (!p.leavingDone) return res.status(409).json({ error: 'Mark leaving with patient before completion' });
+  }
 
   trip.checkpointMeta = trip.checkpointMeta || {};
+
+  if (status === 'trip_in_progress') {
+    trip.checkpointMeta.tripInProgress = {
+      ...(trip.checkpointMeta.tripInProgress || {}),
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
+
+  if (status === 'arrived_pickup') {
+    trip.checkpointMeta.arrivedPickup = {
+      ...(trip.checkpointMeta.arrivedPickup || {}),
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
+
+  if (status === 'completed') {
+    trip.checkpointMeta.completed = {
+      ...(trip.checkpointMeta.completed || {}),
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
 
   trip.status = status;
   trip.tripLogs = trip.tripLogs || [];
   trip.tripLogs.push({ status, at: new Date().toISOString(), by: req.user.id, meta });
   writeJson(FILES.trips, trips);
-  io.emit('trip:updated', trip);
+  io.emit('trip:updated', { trip, status, byId: req.user.id, byName: req.user.name });
   res.json({ trip });
 });
 
