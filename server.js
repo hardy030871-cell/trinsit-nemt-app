@@ -5,6 +5,7 @@ const http = require('http');
 const multer = require('multer');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -174,20 +175,58 @@ const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
   filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g,'_')}`)
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024, files: 6 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = new Set(['image/jpeg','image/png','image/webp','image/gif','application/pdf']);
+    if (allowed.has(file.mimetype)) return cb(null, true);
+    cb(new Error('Unsupported file type'));
+  }
+});
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(UPLOADS_DIR));
 app.use(express.static(PUBLIC_DIR));
 
-function makeToken(user) {
-  return Buffer.from(`${user.id}|${user.role}|${Date.now()}`).toString('base64url');
+function resolveTokenSecret() {
+  if (process.env.TOKEN_SECRET) return process.env.TOKEN_SECRET;
+  const secretFile = path.join(DATA_DIR, '.token-secret');
+  try {
+    if (fs.existsSync(secretFile)) return fs.readFileSync(secretFile, 'utf8').trim();
+  } catch {}
+  const secret = crypto.randomBytes(32).toString('hex');
+  try { fs.writeFileSync(secretFile, secret, { mode: 0o600 }); } catch {}
+  return secret;
 }
+
+const TOKEN_SECRET = resolveTokenSecret();
+const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+
+function signValue(value) {
+  return crypto.createHmac('sha256', TOKEN_SECRET).update(value).digest('base64url');
+}
+
+function makeToken(user) {
+  const payload = { uid: user.id, iat: Date.now(), exp: Date.now() + TOKEN_TTL_MS };
+  const payloadRaw = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = signValue(payloadRaw);
+  return `${payloadRaw}.${sig}`;
+}
+
 function parseToken(token) {
   try {
-    const [id] = Buffer.from(token, 'base64url').toString('utf8').split('|');
-    return id;
+    const [payloadRaw, sig] = String(token || '').split('.');
+    if (!payloadRaw || !sig) return null;
+    const expected = signValue(payloadRaw);
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+    const payload = JSON.parse(Buffer.from(payloadRaw, 'base64url').toString('utf8'));
+    if (!payload || typeof payload.uid !== 'string') return null;
+    if (!Number.isFinite(payload.exp) || payload.exp < Date.now()) return null;
+    return payload.uid;
   } catch {
     return null;
   }
@@ -257,6 +296,20 @@ function listUploadedFilesForDay(day) {
   return files;
 }
 
+io.use((socket, next) => {
+  const userId = parseToken(socket.handshake?.auth?.token || '');
+  if (!userId) return next(new Error('Unauthorized'));
+  const users = readJson(FILES.users, []);
+  const user = users.find(u => u.id === userId && u.active);
+  if (!user) return next(new Error('Unauthorized'));
+  socket.user = user;
+  next();
+});
+
+io.on('connection', socket => {
+  if (socket.user && socket.user.id) socket.join('user:' + socket.user.id);
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'TRINSIT Rebuild', timestamp: new Date().toISOString() });
 });
@@ -286,7 +339,9 @@ app.get('/api/bootstrap', auth, (req, res) => {
   const equipment = readJson(FILES.equipment, []);
   const settings = readJson(FILES.settings, {});
   const liveLocations = pruneLiveLocations(readJson(FILES.live, {}));
-  const chat = readJson(FILES.chat, { channels: [], direct: [] });
+  const chatSeed = readJson(FILES.chat, { channels: [], direct: [] });
+  const visibleDirect = (chatSeed.direct || []).filter(msg => msg.fromId === req.user.id || (msg.toIds || []).includes(req.user.id));
+  const chat = { channels: Array.isArray(chatSeed.channels) ? chatSeed.channels : [], direct: visibleDirect };
   writeJson(FILES.live, liveLocations);
   res.json({ user: sanitizeUser(req.user), users, trips, attendance, expenses, equipment, settings, liveLocations, chat });
 });
@@ -420,6 +475,19 @@ app.get('/api/trips', auth, (req, res) => {
   res.json(visible);
 });
 
+function getTripProgressState(trip) {
+  const logs = trip.tripLogs || [];
+  const has = (s) => trip.status === s || logs.some(l => l.status === s || l.action === s || l.type === s);
+  const hasEvidence = Array.isArray(trip.checkpointEvidenceFiles) && trip.checkpointEvidenceFiles.length > 0;
+  return {
+    inProgressDone: has('trip_in_progress'),
+    arrivedDone: has('arrived_pickup'),
+    leavingDone: has('leaving_with_patient'),
+    completedDone: has('completed'),
+    hasEvidence
+  };
+}
+
 function roleFilterTrips(user, trips) {
   if (['admin','dispatcher','manager'].includes(user.role)) return trips;
   return trips.filter(t => (t.driverIds || []).includes(user.id));
@@ -449,6 +517,8 @@ app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, 
     driverIds: Array.isArray(body.driverIds) ? [...new Set(body.driverIds)].slice(0,2) : [],
     tripLogs: [{ status: 'assigned', at: new Date().toISOString(), by: req.user.id }],
     facesheetFiles: [],
+    checkpointEvidenceFiles: [],
+    checkpointMeta: {},
     createdAt: new Date().toISOString()
   };
   trips.push(trip);
@@ -493,6 +563,7 @@ app.post('/api/trips/assign', auth, requireRole('admin','dispatcher','manager'),
 app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver','admin','dispatcher','manager'), (req, res) => {
   const allowed = ['trip_in_progress','arrived_pickup','leaving_with_patient','completed','cancelled','on_hold'];
   const { status } = req.body;
+  const meta = req.body && typeof req.body.meta === 'object' && req.body.meta ? req.body.meta : {};
   if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const trips = readJson(FILES.trips, []);
   const trip = trips.find(t => t.id === req.params.id);
@@ -501,9 +572,58 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   if (!isOps && !(trip.driverIds || []).includes(req.user.id)) return res.status(403).json({ error: 'Trip not assigned to you' });
   if (!isOps && !currentAttendance(req.user.id)) return res.status(409).json({ error: 'Clock in before updating trip progress' });
   if (!isOps && ['cancelled','on_hold'].includes(status)) return res.status(403).json({ error: 'Only admin/manager/dispatch can cancel or hold trips' });
+
+  const p = getTripProgressState(trip);
+  if (status === 'arrived_pickup' && !p.inProgressDone) return res.status(409).json({ error: 'Trip must be in progress first' });
+  if (status === 'leaving_with_patient' && !p.arrivedDone) return res.status(409).json({ error: 'Mark arrived before leaving with patient' });
+  if (status === 'completed') {
+    if (!p.leavingDone) return res.status(409).json({ error: 'Mark leaving with patient before completion' });
+    if (!p.hasEvidence) return res.status(409).json({ error: 'Upload required trip evidence before completion' });
+  }
+
+  trip.checkpointMeta = trip.checkpointMeta || {};
+
+  if (status === 'trip_in_progress') {
+    const odometerStart = Number(meta.odometerStart);
+    if (!Number.isFinite(odometerStart) || odometerStart < 0) return res.status(400).json({ error: 'Starting odometer is required' });
+    trip.checkpointMeta.tripInProgress = {
+      ...(trip.checkpointMeta.tripInProgress || {}),
+      odometerStart,
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
+
+  if (status === 'arrived_pickup') {
+    const pickupSignatureName = String(meta.pickupSignatureName || '').trim();
+    if (!pickupSignatureName) return res.status(400).json({ error: 'Pickup signature name is required' });
+    trip.checkpointMeta.arrivedPickup = {
+      ...(trip.checkpointMeta.arrivedPickup || {}),
+      pickupSignatureName,
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
+
+  if (status === 'completed') {
+    const odometerEnd = Number(meta.odometerEnd);
+    const dropoffSignatureName = String(meta.dropoffSignatureName || '').trim();
+    if (!Number.isFinite(odometerEnd) || odometerEnd < 0) return res.status(400).json({ error: 'Ending odometer is required' });
+    if (!dropoffSignatureName) return res.status(400).json({ error: 'Dropoff signature name is required' });
+    const startOdo = Number(trip.checkpointMeta?.tripInProgress?.odometerStart);
+    if (Number.isFinite(startOdo) && odometerEnd < startOdo) return res.status(400).json({ error: 'Ending odometer cannot be less than starting odometer' });
+    trip.checkpointMeta.completed = {
+      ...(trip.checkpointMeta.completed || {}),
+      odometerEnd,
+      dropoffSignatureName,
+      at: new Date().toISOString(),
+      by: req.user.id
+    };
+  }
+
   trip.status = status;
   trip.tripLogs = trip.tripLogs || [];
-  trip.tripLogs.push({ status, at: new Date().toISOString(), by: req.user.id });
+  trip.tripLogs.push({ status, at: new Date().toISOString(), by: req.user.id, meta });
   writeJson(FILES.trips, trips);
   io.emit('trip:updated', trip);
   res.json({ trip });
@@ -520,6 +640,22 @@ app.post('/api/trips/:id/facesheet', auth, upload.single('file'), (req, res) => 
   trip.facesheetFiles.push({ id: uuidv4(), file: `/uploads/${req.file.filename}`, at: new Date().toISOString(), by: req.user.id });
   trip.tripLogs = trip.tripLogs || [];
   trip.tripLogs.push({ status: 'facesheet_uploaded', at: new Date().toISOString(), by: req.user.id });
+  writeJson(FILES.trips, trips);
+  io.emit('trip:updated', trip);
+  res.json({ trip });
+});
+
+app.post('/api/trips/:id/evidence', auth, upload.single('file'), (req, res) => {
+  const trips = readJson(FILES.trips, []);
+  const trip = trips.find(t => t.id === req.params.id);
+  if (!trip) return res.status(404).json({ error: 'Trip not found' });
+  const isOps = ['admin','dispatcher','manager'].includes(req.user.role);
+  if (!isOps && !(trip.driverIds || []).includes(req.user.id)) return res.status(403).json({ error: 'Trip not assigned to you' });
+  if (!req.file) return res.status(400).json({ error: 'Evidence file is required' });
+  trip.checkpointEvidenceFiles = trip.checkpointEvidenceFiles || [];
+  trip.checkpointEvidenceFiles.push({ id: uuidv4(), file: '/uploads/' + req.file.filename, at: new Date().toISOString(), by: req.user.id });
+  trip.tripLogs = trip.tripLogs || [];
+  trip.tripLogs.push({ status: 'checkpoint_evidence_uploaded', at: new Date().toISOString(), by: req.user.id });
   writeJson(FILES.trips, trips);
   io.emit('trip:updated', trip);
   res.json({ trip });
@@ -718,10 +854,15 @@ app.put('/api/settings/custom-fields', auth, requireRole('admin'), (req, res) =>
 
 app.post('/api/chat/send', auth, (req, res) => {
   const chat = readJson(FILES.chat, { channels: [], direct: [] });
-  const msg = { id: uuidv4(), fromId: req.user.id, fromName: req.user.name, toIds: req.body.toIds || [], text: req.body.text, at: new Date().toISOString() };
+  const toIds = Array.isArray(req.body.toIds) ? [...new Set(req.body.toIds.filter(v => typeof v === 'string' && v.trim()))] : [];
+  const text = String(req.body.text || '').trim();
+  if (!toIds.length) return res.status(400).json({ error: 'At least one recipient is required' });
+  if (!text) return res.status(400).json({ error: 'Message text is required' });
+  const msg = { id: uuidv4(), fromId: req.user.id, fromName: req.user.name, toIds, text, at: new Date().toISOString() };
   chat.direct.push(msg);
   writeJson(FILES.chat, chat);
-  io.emit('chat:new', msg);
+  const recipients = [...new Set([msg.fromId, ...(Array.isArray(msg.toIds) ? msg.toIds : [])])];
+  for (const userId of recipients) io.to('user:' + userId).emit('chat:new', msg);
   res.json(msg);
 });
 
@@ -735,6 +876,14 @@ app.post('/api/location', auth, (req, res) => {
   writeJson(FILES.live, live);
   io.emit('location:update', live[req.user.id]);
   res.json({ ok: true });
+});
+
+app.use((err, _req, res, _next) => {
+  if (err && (err.code === 'LIMIT_FILE_SIZE' || err.code === 'LIMIT_UNEXPECTED_FILE' || /Unsupported file type/.test(err.message || ''))) {
+    return res.status(400).json({ error: err.message || 'Invalid upload' });
+  }
+  if (err) return res.status(500).json({ error: 'Server error' });
+  return res.status(500).json({ error: 'Server error' });
 });
 
 app.get('*', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
