@@ -17,7 +17,9 @@ const state = {
   socket: null,
   locationWatchId: null,
   wakeLock: null,
-  lastLocation: null
+  lastLocation: null,
+  notifications: [],
+  notificationCount: 0
 };
 
 function api(path, options = {}) {
@@ -49,6 +51,7 @@ function complianceMissingItems(trip){
   return missing;
 }
 function currentAttendance(userId){ return state.attendance.find(a => a.userId === userId && !a.clockOutAt); }
+function sortTripsNewest(trips){ return [...(trips || [])].sort((a,b) => new Date(b.createdAt || b.pickupTime || 0) - new Date(a.createdAt || a.pickupTime || 0)); }
 
 async function bootstrap(){
   if (!state.token) return renderLogin();
@@ -72,16 +75,14 @@ function connectSocket(){
   state.socket.on('trip:assigned', async trip => {
     await refreshData();
     if ((trip.driverIds||[]).includes(state.user.id)) {
-      notify('New Trip Assigned', `${trip.patientName || 'New patient'} at ${trip.pickupLocation || 'pickup location'}`, { kind: 'trip' });
+      notify('New Trip Assigned', `${trip.patientName} at ${trip.pickupLocation}`, { kind: 'trip' });
     }
   });
-  state.socket.on('trip:updated', async payload => {
-    const trip = payload && payload.trip ? payload.trip : payload;
-    const status = payload && payload.status ? payload.status : trip?.status;
+  state.socket.on('trip:updated', async trip => {
     await refreshData();
-    if (roleIs('admin','dispatcher','manager') && ['trip_in_progress','completed'].includes(status)) {
-      const label = status === 'trip_in_progress' ? 'Trip In Progress' : 'Trip Completed';
-      notify(label, `${trip?.id || 'Trip'} - ${trip?.patientName || ''}`, { kind: 'trip' });
+    if (roleIs('admin','dispatcher','manager') && ['trip_in_progress','completed'].includes(trip.status)) {
+      const label = trip.status === 'completed' ? 'Trip Completed' : 'Trip In Progress';
+      notify(label, `${trip.id} · ${trip.patientName || 'Trip update'}`, { kind: 'trip' });
     }
   });
   state.socket.on('location:update', payload => { state.liveLocations[payload.userId] = payload; if (state.page === 'live-map') renderMap(true); });
@@ -146,8 +147,11 @@ function urgentDeviceAlert(kind = 'message') {
 }
 
 function notify(title, body, { kind = 'message' } = {}){
+  state.notificationCount = (state.notificationCount || 0) + 1;
+  state.notifications.unshift({ title, body, kind, at: new Date().toISOString() });
+  updateBell();
   if ('Notification' in window && Notification.permission === 'granted') {
-    new Notification(title, { body, tag: 'trinsit-' + kind, renotify: true, silent: false });
+    new Notification(title, { body, tag: 'trinsit-' + kind + '-' + Date.now(), renotify: true, silent: false });
   }
   urgentDeviceAlert(kind);
   const original = document.title;
@@ -157,6 +161,20 @@ function notify(title, body, { kind = 'message' } = {}){
     flashes++;
     if (flashes > 12) { clearInterval(timer); document.title = original; }
   }, 700);
+}
+function updateBell(){
+  const badge = document.getElementById('notifBadge');
+  if (badge) {
+    badge.textContent = state.notificationCount || '';
+    badge.style.display = state.notificationCount ? 'inline-flex' : 'none';
+  }
+}
+function openNotifications(){
+  const recent = state.notifications.slice(0,10);
+  state.notificationCount = 0;
+  updateBell();
+  const body = recent.length ? recent.map(n => `${n.title}: ${n.body || ''}`).join('\n\n') : 'No new notifications';
+  alert(body);
 }
 
 function renderLogin(){
@@ -231,6 +249,7 @@ function renderShell(){
           <button class="ghost" onclick="toggleDrawer()">☰</button>
           <div class="topbar-title">${pageTitle()}</div>
           <div class="topbar-actions">
+            <button class="ghost notif-bell" onclick="openNotifications()" aria-label="Notifications">🔔 <span id="notifBadge" class="notif-badge" style="display:none"></span></button>
             <button class="ghost" onclick="logout()">Logout</button>
           </div>
         </header>
@@ -238,6 +257,7 @@ function renderShell(){
       </main>
     </div>`;
   renderPage();
+  updateBell();
 }
 
 function pageTitle(){
@@ -277,9 +297,7 @@ function renderPage(){
 }
 
 function renderDashboard(){
-  const myTrips = (roleIs('driver','contractor_driver') ? state.trips.filter(t => (t.driverIds||[]).includes(state.user.id)) : state.trips)
-    .slice()
-    .sort((a,b)=> new Date(b.createdAt || b.pickupTime || 0) - new Date(a.createdAt || a.pickupTime || 0));
+  const myTrips = sortTripsNewest(roleIs('driver','contractor_driver') ? state.trips.filter(t => (t.driverIds||[]).includes(state.user.id)) : state.trips);
   const activeAttendance = state.attendance.filter(a => !a.clockOutAt).length;
   document.getElementById('page').innerHTML = `
     <div class="grid two">
@@ -304,8 +322,7 @@ function tripCard(trip){
 }
 
 function openTrip(id){
-  const matches = state.trips.filter(t => t.id === id).sort((a,b)=> new Date(b.createdAt || b.pickupTime || 0) - new Date(a.createdAt || a.pickupTime || 0));
-  const trip = matches[0];
+  const trip = state.trips.find(t => t.id === id);
   if (!trip) return;
   const modal = document.createElement('div');
   modal.className = 'modal';
@@ -336,24 +353,26 @@ function tripStatusActions(trip){
   const arrivedDone = hasStatus('arrived_pickup');
   const leavingDone = hasStatus('leaving_with_patient');
   const completedDone = hasStatus('completed');
+
   const canStart = !completedDone && !inProgressDone;
   const canArrive = !completedDone && !arrivedDone && inProgressDone;
   const canUpload = !completedDone && !hasFacesheet && arrivedDone;
   const canLeave = !completedDone && !leavingDone && hasFacesheet;
   const canComplete = !completedDone && leavingDone;
+
   return `<div class="progress-vertical">
     <button class="progress-step-btn ${inProgressDone?'done':''}" ${canStart?'':'disabled'} onclick="advanceTrip('${trip.id}','trip_in_progress')">Trip In Progress</button>
     <button class="progress-step-btn ${arrivedDone?'done':''}" ${canArrive?'':'disabled'} onclick="advanceTrip('${trip.id}','arrived_pickup')">Arrived for Pick Up</button>
-    <label class="progress-step ${hasFacesheet?'done':''}">Upload Facesheet<input type="file" accept="image/*,.pdf" ${canUpload?'':'disabled'} onchange="uploadFacesheet('${trip.id}', this.files[0])"></label>
+    <label class="progress-step ${hasFacesheet?'done':''} ${canUpload?'':'locked'}">Upload Facesheet<input type="file" ${canUpload?'':'disabled'} onchange="uploadFacesheet('${trip.id}', this.files[0])"></label>
     <button class="progress-step-btn ${leavingDone?'done':''}" ${canLeave?'':'disabled'} onclick="advanceTrip('${trip.id}','leaving_with_patient')">Leaving With Patient</button>
-    <button class="progress-step-btn ${completedDone?'done':''}" ${canComplete?'':'disabled'} onclick="advanceTrip('${trip.id}','completed')">Trip Completed</button>
+    <button class="progress-step-btn ${completedDone?'done':''}" ${canComplete?'':'disabled'} onclick="advanceTrip('${trip.id}','completed')">Trip Complete</button>
   </div>`;
 }
 
 async function advanceTrip(tripId, status){
   try {
     await api(`/api/trips/${tripId}/status`, { method:'POST', body: JSON.stringify({ status, meta: {} }) });
-    await refreshData({ render:false });
+    await refreshData({ render: false });
     toast('Trip updated');
     document.querySelector('.modal')?.remove();
     openTrip(tripId);
@@ -387,12 +406,12 @@ async function uploadCheckpointEvidence(tripId, file){
 }
 
 function renderTrips(){
-  const trips = roleIs('driver','contractor_driver') ? state.trips.filter(t => (t.driverIds||[]).includes(state.user.id)) : state.trips;
+  const trips = sortTripsNewest(roleIs('driver','contractor_driver') ? state.trips.filter(t => (t.driverIds||[]).includes(state.user.id)) : state.trips);
   document.getElementById('page').innerHTML = `
     ${roleIs('admin','dispatcher','manager') ? createTripForm() : ''}
     <div class="card"><h3>${roleIs('driver','contractor_driver') ? 'Assigned Trips' : 'Trips'}</h3><div class="list">${trips.map(tripCard).join('')}</div></div>`;
   const form = document.getElementById('tripForm');
-  if (form) form.onsubmit = submitTrip;
+  if (form) { form.onsubmit = submitTrip; initTripFormBehavior(form); }
 }
 
 function createTripForm(){
@@ -401,15 +420,25 @@ function createTripForm(){
     <form id="tripForm" class="grid two">
       <input name="patientName" placeholder="Patient Name" required>
       <input type="datetime-local" name="pickupTime" required>
-      <input class="long" name="pickupLocation" placeholder="Pickup Address" required>
+      <input class="long" name="pickupLocation" list="pickupMemoryList" placeholder="Pickup Address" required>
+      <datalist id="pickupMemoryList"></datalist>
       <input class="long" name="dropoffLocation" placeholder="Dropoff Address" required>
-      <input name="service" placeholder="Service (Wheelchair, Stretcher, etc.)" required>
+      <select name="service" required>
+        <option value="">Select Service</option>
+        <option>Wheelchair</option>
+        <option>Stretcher</option>
+        <option>Own Wheelchair</option>
+        <option>Climbing Stairs Wheelchair</option>
+        <option>Ambulatory</option>
+      </select>
       <input name="weight" placeholder="Weight" required>
       <input name="roomNumber" placeholder="Room Number">
-      <input name="oxygen" placeholder="Oxygen Yes/No" required>
-      <input name="oxygenLiters" placeholder="Oxygen Liters">
-      <input name="caregiverCount" placeholder="Caregiver Count">
-      <input name="otherStop" placeholder="Other Stop">
+      <label>Oxygen<select name="oxygen" id="oxygenSelect" required><option value="No">No</option><option value="Yes">Yes</option></select></label>
+      <input name="oxygenLiters" id="oxygenLiters" placeholder="Oxygen Quantity / Liters" style="display:none">
+      <label>Caregiver<select name="caregiver" id="caregiverSelect" required><option value="No">No</option><option value="Yes">Yes</option></select></label>
+      <input name="caregiverCount" id="caregiverCount" placeholder="Number of Caregivers" style="display:none">
+      <label>Additional Stop<select name="hasStop" id="stopSelect" required><option value="No">No</option><option value="Yes">Yes</option></select></label>
+      <input class="long" name="otherStop" id="otherStop" placeholder="Additional Stop Address" style="display:none">
       <select name="payer">${state.settings.payers.map(p=>`<option>${escapeHtml(p)}</option>`).join('')}</select>
       <input name="notes" placeholder="Notes for Driver / Facility">
       <input name="mileage" placeholder="Mileage">
@@ -419,6 +448,29 @@ function createTripForm(){
       <div class="full"><button>Create Trip</button></div>
     </form></div>`;
 }
+function initTripFormBehavior(form){
+  const pickup = form.elements.pickupLocation;
+  const list = form.querySelector('#pickupMemoryList');
+  const addresses = JSON.parse(localStorage.getItem('trinsit_pickup_addresses') || '[]');
+  if (list) list.innerHTML = addresses.map(a => `<option value="${escapeHtml(a)}"></option>`).join('');
+  const toggleRequired = (selectName, inputName) => {
+    const select = form.elements[selectName];
+    const input = form.elements[inputName];
+    if (!select || !input) return;
+    const update = () => {
+      const yes = String(select.value).toLowerCase() === 'yes';
+      input.style.display = yes ? '' : 'none';
+      input.required = yes;
+      if (!yes) input.value = '';
+    };
+    select.addEventListener('change', update);
+    update();
+  };
+  toggleRequired('oxygen', 'oxygenLiters');
+  toggleRequired('caregiver', 'caregiverCount');
+  toggleRequired('hasStop', 'otherStop');
+}
+
 function driverOptions(){ return state.users.filter(u=>['driver','contractor_driver'].includes(u.role)).map(u=>`<option value="${u.id}">${escapeHtml(u.name)}</option>`).join(''); }
 async function submitTrip(e){
   e.preventDefault();
@@ -426,12 +478,27 @@ async function submitTrip(e){
   const driverIds = [fd.get('driver1'), fd.get('driver2')].filter(Boolean);
   const payload = Object.fromEntries(fd.entries());
   payload.driverIds = [...new Set(driverIds)];
+  if (payload.oxygen !== 'Yes') payload.oxygenLiters = '';
+  if (payload.caregiver !== 'Yes') payload.caregiverCount = '';
+  if (payload.hasStop !== 'Yes') payload.otherStop = '';
   payload.customFields = Object.fromEntries(Object.entries(payload).filter(([k]) => k.startsWith('custom_')).map(([k,v]) => [k.replace('custom_',''), v]));
-  try { await api('/api/trips', { method:'POST', body: JSON.stringify(payload) }); toast('Trip created'); await refreshData(); } catch(err){ toast(err.message); }
+  try {
+    await api('/api/trips', { method:'POST', body: JSON.stringify(payload) });
+    const pickup = String(payload.pickupLocation || '').trim();
+    if (pickup) {
+      const addresses = JSON.parse(localStorage.getItem('trinsit_pickup_addresses') || '[]');
+      const next = [pickup, ...addresses.filter(a => a !== pickup)].slice(0, 25);
+      localStorage.setItem('trinsit_pickup_addresses', JSON.stringify(next));
+    }
+    toast('Trip created');
+    e.target.reset();
+    initTripFormBehavior(e.target);
+    await refreshData();
+  } catch(err){ toast(err.message); }
 }
 
 function renderDispatcher(){
-  document.getElementById('page').innerHTML = `<div class="card"><h3>Dispatcher Board</h3><div class="board-grid">${state.trips.map(t=>{ const missing = complianceMissingItems(t); return `
+  document.getElementById('page').innerHTML = `<div class="card"><h3>Dispatcher Board</h3><div class="board-grid">${sortTripsNewest(state.trips).map(t=>{ const missing = complianceMissingItems(t); return `
     <div class="trip-card"><div class="trip-card-head"><strong>${t.id}</strong><span class="pill">${t.status}</span></div>
     <div>${escapeHtml(t.patientName)}</div><div class="muted">${escapeHtml(t.pickupLocation)}</div>${missing.length ? `<div class="muted">Compliance Missing: ${escapeHtml(missing.join(', '))}</div>` : ''}
     <div class="row"><label>Drivers<select multiple onchange="assignDriver('${t.id}', this)">${state.users.filter(u=>['driver','contractor_driver'].includes(u.role)).map(u=>`<option value="${u.id}" ${(t.driverIds||[]).includes(u.id)?'selected':''}>${escapeHtml(u.name)}</option>`).join('')}</select></label></div>
