@@ -477,14 +477,14 @@ app.get('/api/trips', auth, (req, res) => {
 
 function getTripProgressState(trip) {
   const logs = trip.tripLogs || [];
-  const has = (s) => trip.status === s || logs.some(l => l.status === s || l.action === s || l.type === s);
-  const hasEvidence = Array.isArray(trip.checkpointEvidenceFiles) && trip.checkpointEvidenceFiles.length > 0;
+  const has = (st) => trip.status === st || logs.some(l => l.status === st || l.action === st || l.type === st);
+  const hasFacesheet = Array.isArray(trip.facesheetFiles) && trip.facesheetFiles.length > 0 || has('facesheet_uploaded');
   return {
     inProgressDone: has('trip_in_progress'),
     arrivedDone: has('arrived_pickup'),
     leavingDone: has('leaving_with_patient'),
     completedDone: has('completed'),
-    hasEvidence
+    hasFacesheet
   };
 }
 
@@ -507,6 +507,8 @@ app.post('/api/trips', auth, requireRole('admin','dispatcher','manager'), (req, 
     roomNumber: body.roomNumber || '',
     oxygen: body.oxygen,
     oxygenLiters: body.oxygenLiters || '',
+    caregiver: body.caregiver || '',
+    hasStop: body.hasStop || '',
     caregiverCount: body.caregiverCount || '',
     otherStop: body.otherStop || '',
     payer: body.payer || '',
@@ -576,50 +578,9 @@ app.post('/api/trips/:id/status', auth, requireRole('driver','contractor_driver'
   const p = getTripProgressState(trip);
   if (status === 'arrived_pickup' && !p.inProgressDone) return res.status(409).json({ error: 'Trip must be in progress first' });
   if (status === 'leaving_with_patient' && !p.arrivedDone) return res.status(409).json({ error: 'Mark arrived before leaving with patient' });
-  if (status === 'completed') {
-    if (!p.leavingDone) return res.status(409).json({ error: 'Mark leaving with patient before completion' });
-    if (!p.hasEvidence) return res.status(409).json({ error: 'Upload required trip evidence before completion' });
-  }
+  if (status === 'completed' && !p.leavingDone) return res.status(409).json({ error: 'Mark leaving with patient before completion' });
 
   trip.checkpointMeta = trip.checkpointMeta || {};
-
-  if (status === 'trip_in_progress') {
-    const odometerStart = Number(meta.odometerStart);
-    if (!Number.isFinite(odometerStart) || odometerStart < 0) return res.status(400).json({ error: 'Starting odometer is required' });
-    trip.checkpointMeta.tripInProgress = {
-      ...(trip.checkpointMeta.tripInProgress || {}),
-      odometerStart,
-      at: new Date().toISOString(),
-      by: req.user.id
-    };
-  }
-
-  if (status === 'arrived_pickup') {
-    const pickupSignatureName = String(meta.pickupSignatureName || '').trim();
-    if (!pickupSignatureName) return res.status(400).json({ error: 'Pickup signature name is required' });
-    trip.checkpointMeta.arrivedPickup = {
-      ...(trip.checkpointMeta.arrivedPickup || {}),
-      pickupSignatureName,
-      at: new Date().toISOString(),
-      by: req.user.id
-    };
-  }
-
-  if (status === 'completed') {
-    const odometerEnd = Number(meta.odometerEnd);
-    const dropoffSignatureName = String(meta.dropoffSignatureName || '').trim();
-    if (!Number.isFinite(odometerEnd) || odometerEnd < 0) return res.status(400).json({ error: 'Ending odometer is required' });
-    if (!dropoffSignatureName) return res.status(400).json({ error: 'Dropoff signature name is required' });
-    const startOdo = Number(trip.checkpointMeta?.tripInProgress?.odometerStart);
-    if (Number.isFinite(startOdo) && odometerEnd < startOdo) return res.status(400).json({ error: 'Ending odometer cannot be less than starting odometer' });
-    trip.checkpointMeta.completed = {
-      ...(trip.checkpointMeta.completed || {}),
-      odometerEnd,
-      dropoffSignatureName,
-      at: new Date().toISOString(),
-      by: req.user.id
-    };
-  }
 
   trip.status = status;
   trip.tripLogs = trip.tripLogs || [];
