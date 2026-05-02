@@ -15,7 +15,9 @@ const state = {
   map: null,
   markers: {},
   socket: null,
-  locationWatchId: null
+  locationWatchId: null,
+  wakeLock: null,
+  lastLocation: null
 };
 
 function api(path, options = {}) {
@@ -33,6 +35,19 @@ function roleIs(...roles){ return state.user && roles.includes(state.user.role);
 function escapeHtml(s=''){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function toast(msg){ alert(msg); }
 function fmtDateTime(v){ if(!v) return ''; const d = new Date(v); return d.toLocaleString(); }
+function complianceMissingItems(trip){
+  const logs = trip.tripLogs || [];
+  const hasStatus = s => trip.status === s || logs.some(l => l.action === s || l.status === s || l.type === s);
+  const hasEvidence = (trip.checkpointEvidenceFiles || []).length > 0 || hasStatus('checkpoint_evidence_uploaded');
+  const meta = trip.checkpointMeta || {};
+  const missing = [];
+  if (!Number.isFinite(Number(meta?.tripInProgress?.odometerStart))) missing.push('Start odometer');
+  if (!String(meta?.arrivedPickup?.pickupSignatureName || '').trim()) missing.push('Pickup signature');
+  if (!hasEvidence) missing.push('Trip evidence file');
+  if (!Number.isFinite(Number(meta?.completed?.odometerEnd))) missing.push('End odometer');
+  if (!String(meta?.completed?.dropoffSignatureName || '').trim()) missing.push('Dropoff signature');
+  return missing;
+}
 function currentAttendance(userId){ return state.attendance.find(a => a.userId === userId && !a.clockOutAt); }
 
 async function bootstrap(){
@@ -52,14 +67,14 @@ async function bootstrap(){
 
 function connectSocket(){
   if (state.socket) return;
-  state.socket = io();
+  state.socket = io({ auth: { token: state.token } });
   state.socket.on('trip:new', async () => refreshData());
-  state.socket.on('trip:assigned', async trip => { await refreshData(); if ((trip.driverIds||[]).includes(state.user.id)) notify('New Trip Assigned', `${trip.patientName} at ${trip.pickupLocation}`); });
+  state.socket.on('trip:assigned', async trip => { await refreshData(); if ((trip.driverIds||[]).includes(state.user.id)) notify('New Trip Assigned', `${trip.patientName} at ${trip.pickupLocation}`, { kind: 'trip' }); });
   state.socket.on('trip:updated', async () => refreshData());
   state.socket.on('location:update', payload => { state.liveLocations[payload.userId] = payload; if (state.page === 'live-map') renderMap(true); });
   state.socket.on('chat:new', async msg => {
     state.chat.direct.push(msg);
-    if (msg.toIds.includes(state.user.id) || msg.fromId === state.user.id) notify('New Message', msg.text);
+    if (((Array.isArray(msg.toIds) ? msg.toIds : [])).includes(state.user.id) || msg.fromId === state.user.id) notify('New Message', msg.text, { kind: 'message' });
     if (state.page === 'chat') renderPage();
   });
 }
@@ -71,17 +86,64 @@ async function refreshData({ render = true } = {}){
   if (render) renderPage();
 }
 
-function notify(title, body){
-  if ('Notification' in window && Notification.permission === 'granted') {
-    new Notification(title, { body });
+let audioCtx = null;
+
+function getAudioCtx() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) audioCtx = new Ctx();
   }
+  return audioCtx;
+}
+
+function beepSequence(count = 3, gapMs = 280, freq = 960) {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  for (let i = 0; i < count; i++) {
+    const startAt = ctx.currentTime + (i * gapMs) / 1000;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, startAt);
+    gain.gain.exponentialRampToValueAtTime(0.35, startAt + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.18);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(startAt);
+    osc.stop(startAt + 0.2);
+  }
+}
+
+function buzz(pattern) {
+  if (navigator.vibrate) navigator.vibrate(pattern);
+}
+
+function urgentDeviceAlert(kind = 'message') {
+  if (kind === 'trip') {
+    beepSequence(5, 260, 880);
+    buzz([220, 140, 220, 140, 220]);
+    setTimeout(() => beepSequence(4, 260, 1040), 1500);
+    setTimeout(() => buzz([320, 150, 320]), 1500);
+    return;
+  }
+  beepSequence(3, 260, 1100);
+  buzz([180, 120, 180]);
+}
+
+function notify(title, body, { kind = 'message' } = {}){
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification(title, { body, tag: 'trinsit-' + kind, renotify: true, silent: false });
+  }
+  urgentDeviceAlert(kind);
   const original = document.title;
   let flashes = 0;
   const timer = setInterval(()=>{
     document.title = document.title === original ? `🔔 ${title}` : original;
     flashes++;
-    if (flashes > 8) { clearInterval(timer); document.title = original; }
-  }, 800);
+    if (flashes > 12) { clearInterval(timer); document.title = original; }
+  }, 700);
 }
 
 function renderLogin(){
@@ -216,8 +278,9 @@ function renderDashboard(){
 }
 
 function tripCard(trip){
+  const missing = complianceMissingItems(trip);
   return `<div class="trip-card">
-    <div class="trip-card-head"><strong>${trip.id}</strong><span class="pill">${trip.status}</span></div>
+    <div class="trip-card-head"><strong>${trip.id}</strong><span class="pill">${trip.status}</span></div>${missing.length ? `<div class="muted">Missing: ${escapeHtml(missing.join(', '))}</div>` : ''}
     <div>${escapeHtml(trip.patientName)}</div>
     <div class="muted">${fmtDateTime(trip.pickupTime)}</div>
     <div class="muted">${escapeHtml(trip.pickupLocation)} → ${escapeHtml(trip.dropoffLocation)}</div>
@@ -253,6 +316,7 @@ function tripStatusActions(trip){
   const logs = trip.tripLogs || trip.log || [];
   const hasStatus = s => trip.status === s || logs.some(l => l.action === s || l.status === s || l.type === s);
   const hasFacesheet = (trip.facesheetFiles || []).length > 0 || hasStatus('facesheet_uploaded');
+  const hasEvidence = (trip.checkpointEvidenceFiles || []).length > 0 || hasStatus('checkpoint_evidence_uploaded');
   const inProgressDone = hasStatus('trip_in_progress');
   const arrivedDone = hasStatus('arrived_pickup');
   const leavingDone = hasStatus('leaving_with_patient');
@@ -261,19 +325,43 @@ function tripStatusActions(trip){
   const canArrive = !completedDone && !arrivedDone && inProgressDone;
   const canUpload = !completedDone && !hasFacesheet && arrivedDone;
   const canLeave = !completedDone && !leavingDone && hasFacesheet;
-  const canComplete = !completedDone && leavingDone;
+  const canComplete = !completedDone && leavingDone && hasEvidence;
   return `<div class="progress-vertical">
     <button class="progress-step-btn ${inProgressDone?'done':''}" ${canStart?'':'disabled'} onclick="advanceTrip('${trip.id}','trip_in_progress')">Trip In Progress</button>
     <button class="progress-step-btn ${arrivedDone?'done':''}" ${canArrive?'':'disabled'} onclick="advanceTrip('${trip.id}','arrived_pickup')">Arrived for Pick Up</button>
     <label class="progress-step ${hasFacesheet?'done':''}">Upload Facesheet<input type="file" ${canUpload?'':'disabled'} onchange="uploadFacesheet('${trip.id}', this.files[0])"></label>
     <button class="progress-step-btn ${leavingDone?'done':''}" ${canLeave?'':'disabled'} onclick="advanceTrip('${trip.id}','leaving_with_patient')">Leaving With Patient</button>
+    <label class="progress-step ${hasEvidence?'done':''}">Upload Trip Evidence<input type="file" ${leavingDone && !completedDone ? '' : 'disabled'} onchange="uploadCheckpointEvidence('${trip.id}', this.files[0])"></label>
     <button class="progress-step-btn ${completedDone?'done':''}" ${canComplete?'':'disabled'} onclick="advanceTrip('${trip.id}','completed')">Trip Completed</button>
   </div>`;
 }
 
 async function advanceTrip(tripId, status){
   try {
-    await api(`/api/trips/${tripId}/status`, { method:'POST', body: JSON.stringify({ status }) });
+    const meta = {};
+    if (status === 'trip_in_progress') {
+      const val = prompt('Enter starting odometer');
+      if (val === null) return;
+      meta.odometerStart = Number(val);
+      if (!Number.isFinite(meta.odometerStart) || meta.odometerStart < 0) return toast('Valid starting odometer required');
+    }
+    if (status === 'arrived_pickup') {
+      const sig = prompt('Enter pickup signature name');
+      if (sig === null) return;
+      meta.pickupSignatureName = String(sig || '').trim();
+      if (!meta.pickupSignatureName) return toast('Pickup signature name is required');
+    }
+    if (status === 'completed') {
+      const odo = prompt('Enter ending odometer');
+      if (odo === null) return;
+      meta.odometerEnd = Number(odo);
+      if (!Number.isFinite(meta.odometerEnd) || meta.odometerEnd < 0) return toast('Valid ending odometer required');
+      const sig = prompt('Enter dropoff signature name');
+      if (sig === null) return;
+      meta.dropoffSignatureName = String(sig || '').trim();
+      if (!meta.dropoffSignatureName) return toast('Dropoff signature name is required');
+    }
+    await api(`/api/trips/${tripId}/status`, { method:'POST', body: JSON.stringify({ status, meta }) });
     await refreshData();
     toast('Trip updated');
     document.querySelector('.modal')?.remove();
@@ -289,6 +377,19 @@ async function uploadFacesheet(tripId, file){
     await api(`/api/trips/${tripId}/facesheet`, { method:'POST', body: fd });
     await refreshData();
     toast('Facesheet uploaded');
+    document.querySelector('.modal')?.remove();
+    openTrip(tripId);
+  } catch(err){ toast(err.message); }
+}
+
+async function uploadCheckpointEvidence(tripId, file){
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    await api('/api/trips/' + tripId + '/evidence', { method:'POST', body: fd });
+    await refreshData();
+    toast('Trip evidence uploaded');
     document.querySelector('.modal')?.remove();
     openTrip(tripId);
   } catch(err){ toast(err.message); }
@@ -339,11 +440,11 @@ async function submitTrip(e){
 }
 
 function renderDispatcher(){
-  document.getElementById('page').innerHTML = `<div class="card"><h3>Dispatcher Board</h3><div class="board-grid">${state.trips.map(t=>`
+  document.getElementById('page').innerHTML = `<div class="card"><h3>Dispatcher Board</h3><div class="board-grid">${state.trips.map(t=>{ const missing = complianceMissingItems(t); return `
     <div class="trip-card"><div class="trip-card-head"><strong>${t.id}</strong><span class="pill">${t.status}</span></div>
-    <div>${escapeHtml(t.patientName)}</div><div class="muted">${escapeHtml(t.pickupLocation)}</div>
+    <div>${escapeHtml(t.patientName)}</div><div class="muted">${escapeHtml(t.pickupLocation)}</div>${missing.length ? `<div class="muted">Compliance Missing: ${escapeHtml(missing.join(', '))}</div>` : ''}
     <div class="row"><label>Drivers<select multiple onchange="assignDriver('${t.id}', this)">${state.users.filter(u=>['driver','contractor_driver'].includes(u.role)).map(u=>`<option value="${u.id}" ${(t.driverIds||[]).includes(u.id)?'selected':''}>${escapeHtml(u.name)}</option>`).join('')}</select></label></div>
-    <div class="actions wrap"><button onclick="openTrip('${t.id}')">Open</button><button class="ghost" onclick="changeTripStatus('${t.id}','on_hold')">Hold</button><button class="ghost danger" onclick="changeTripStatus('${t.id}','cancelled')">Cancel</button></div></div>`).join('')}</div></div>`;
+    <div class="actions wrap"><button onclick="openTrip('${t.id}')">Open</button><button class="ghost" onclick="changeTripStatus('${t.id}','on_hold')">Hold</button><button class="ghost danger" onclick="changeTripStatus('${t.id}','cancelled')">Cancel</button></div></div>`; }).join('')}</div></div>`;
 }
 async function deleteCancelledTrip(id){ if(!confirm('Delete this cancelled trip permanently?')) return; try{ await api(`/api/trips/${id}`, { method:'DELETE' }); toast('Cancelled trip deleted'); document.querySelector('.modal')?.remove(); await refreshData(); }catch(err){ toast(err.message); } }
 
@@ -719,27 +820,95 @@ async function deletePayer(index){
   } catch(err){ toast(err.message); }
 }
 
-async function sendLiveLocation(){
-  if (!state.token || !state.user || !navigator.geolocation || !currentAttendance(state.user.id)) return;
-  navigator.geolocation.getCurrentPosition(async pos => {
-    try { await api('/api/location', { method:'POST', body: JSON.stringify({ lat: pos.coords.latitude, lng: pos.coords.longitude }) }); } catch {}
-  }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 10000 });
+async function postLocation(lat, lng){
+  try { await api('/api/location', { method:'POST', body: JSON.stringify({ lat, lng }) }); } catch {}
 }
+
+async function sendLiveLocation(forceFresh = false){
+  if (!state.token || !state.user || !currentAttendance(state.user.id)) return;
+  if (!navigator.geolocation) return;
+
+  const maxAge = forceFresh ? 0 : (document.hidden ? 15000 : 7000);
+  const timeout = document.hidden ? 15000 : 10000;
+
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const lat = Number(pos.coords.latitude);
+    const lng = Number(pos.coords.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    state.lastLocation = { lat, lng, at: Date.now(), accuracy: pos.coords.accuracy || null };
+    await postLocation(lat, lng);
+  }, async () => {
+    if (!state.lastLocation) return;
+    if (Date.now() - state.lastLocation.at > 90000) return;
+    await postLocation(state.lastLocation.lat, state.lastLocation.lng);
+  }, { enableHighAccuracy: true, maximumAge: maxAge, timeout });
+}
+
+async function requestWakeLock(){
+  try {
+    if (!('wakeLock' in navigator) || state.wakeLock || document.hidden) return;
+    state.wakeLock = await navigator.wakeLock.request('screen');
+    state.wakeLock.addEventListener('release', () => { state.wakeLock = null; });
+  } catch {}
+}
+
+function releaseWakeLock(){
+  if (state.wakeLock) {
+    state.wakeLock.release().catch(() => {});
+    state.wakeLock = null;
+  }
+}
+
 function updateLocationTracking(){
   if (!state.user || !currentAttendance(state.user.id)) return stopLocationTracking();
-  if (!navigator.geolocation || state.locationWatchId !== null) return;
+  if (!navigator.geolocation) return;
+
+  requestWakeLock();
+
+  if (state.locationWatchId !== null) return;
   state.locationWatchId = navigator.geolocation.watchPosition(async pos => {
-    try {
-      await api('/api/location', { method:'POST', body: JSON.stringify({ lat: pos.coords.latitude, lng: pos.coords.longitude }) });
-    } catch {}
-  }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 10000 });
+    const lat = Number(pos.coords.latitude);
+    const lng = Number(pos.coords.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    state.lastLocation = { lat, lng, at: Date.now(), accuracy: pos.coords.accuracy || null };
+    await postLocation(lat, lng);
+  }, async () => {
+    await sendLiveLocation(false);
+  }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 12000 });
 }
+
 function stopLocationTracking(){
   if (state.locationWatchId !== null && navigator.geolocation) {
     navigator.geolocation.clearWatch(state.locationWatchId);
   }
   state.locationWatchId = null;
+  releaseWakeLock();
 }
-setInterval(() => sendLiveLocation(), 15000);
+
+document.addEventListener('visibilitychange', () => {
+  if (!state.token || !state.user) return;
+  if (document.hidden) {
+    sendLiveLocation(false);
+    return;
+  }
+  requestWakeLock();
+  sendLiveLocation(true);
+  updateLocationTracking();
+});
+
+window.addEventListener('focus', () => {
+  if (!state.token || !state.user) return;
+  requestWakeLock();
+  sendLiveLocation(true);
+  updateLocationTracking();
+});
+
+window.addEventListener('online', () => {
+  if (!state.token || !state.user) return;
+  sendLiveLocation(true);
+  updateLocationTracking();
+});
+
+setInterval(() => sendLiveLocation(document.hidden), 12000);
 
 bootstrap();
